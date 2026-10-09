@@ -1,0 +1,6 @@
+[Unit]
+Description=Deliver agent-to-agent handoffs into the target agent's session
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-agent deliver

@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude agent routine %i
+
+[Service]
+Type=oneshot
+# %i is <agent>-<routine>; the prompt is /etc/claude-agents/routines/%i.txt (root-owned on purpose).
+ExecStart=/bin/sh -c 'exec /usr/local/bin/claude-agent say "$${1%%%%-*}" "$(cat /etc/claude-agents/routines/$1.txt)"' _ %i

@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code Remote Control agent %i (tmux)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+Environment=LANG=C.UTF-8
+ExecStart=/usr/local/bin/claude-agent start %i
+ExecStop=/usr/local/bin/claude-agent stop %i
+# When claude exits the tmux server exits too; restart and resume the conversation.
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target

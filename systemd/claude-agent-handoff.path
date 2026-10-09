@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for agent-to-agent handoffs
+
+[Path]
+PathExistsGlob=/var/lib/claude-agents/handoffs/inbox/*.md
+# Retry undeliverable handoffs (target agent down) without spinning.
+TriggerLimitIntervalSec=60
+TriggerLimitBurst=4
+
+[Install]
+WantedBy=multi-user.target

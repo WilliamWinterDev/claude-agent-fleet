@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# claude-agent: run always-on Claude Code Remote Control agents on a Linux host, one tmux session each.
+#
+#   claude-agent start <name>      start the agent's tmux session (used by claude-agent@<name>.service)
+#   claude-agent stop <name>       stop it
+#   claude-agent run <name>        (inside tmux) exec claude with the agent's settings
+#   claude-agent say <name> <msg>  type a prompt into the running session (routines, handoffs)
+#   claude-agent peek <name>       print the visible screen of the session
+#   claude-agent deliver           deliver queued handoffs from /var/lib/claude-agents/handoffs/inbox
+#   claude-agent list              show agents and whether they're running
+#
+# Each agent has a root-owned config /etc/claude-agents/<name>.env (root sources it, so it must
+# never live in a folder the agent's user can write):
+#   RC_NAME (name shown in the Claude app), RUN_AS (user), optional MODEL,
+#   ADD_DIRS (space-separated), PERMISSION_MODE (default bypassPermissions)
+# and a working folder /var/lib/claude-agents/<name>/ owned by RUN_AS with:
+#   secrets.env   optional, mode 600, sourced into the session environment as RUN_AS (never committed)
+#   CLAUDE.md, .mcp.json, .claude/settings.json  the agent's instructions, tools and deny rules
+set -euo pipefail
+
+AGENTS_DIR=/var/lib/claude-agents
+CONF_DIR=/etc/claude-agents
+HANDOFF_DIR=$AGENTS_DIR/handoffs
+
+die() { echo "claude-agent: $*" >&2; exit 1; }
+
+load() {
+  NAME=${1:?agent name required}
+  [[ $NAME =~ ^[a-z0-9-]+$ ]] || die "bad agent name: $NAME"
+  DIR=$AGENTS_DIR/$NAME
+  [[ -f $CONF_DIR/$NAME.env ]] || die "no $CONF_DIR/$NAME.env"
+  RC_NAME=$NAME RUN_AS=root MODEL="" ADD_DIRS="" PERMISSION_MODE=bypassPermissions
+  # shellcheck source=/dev/null
+  source "$CONF_DIR/$NAME.env"
+  SOCK=claude-$NAME
+}
+
+as_user() {
+  if [[ $RUN_AS == root ]]; then "$@"; else runuser -u "$RUN_AS" -- "$@"; fi
+}
+
+tmx() { as_user tmux -L "$SOCK" "$@"; }
+
+running() { tmx has-session -t "$NAME" 2>/dev/null; }
+
+cmd_start() {
+  load "$1"
+  running && { echo "$NAME already running"; return 0; }
+  tmx new-session -d -s "$NAME" -x 200 -y 50 -c "$DIR" "/usr/local/bin/claude-agent run $NAME"
+  tmx set-option -t "$NAME" history-limit 20000 >/dev/null
+}
+
+cmd_stop() {
+  load "$1"
+  tmx kill-server 2>/dev/null || true
+}
+
+cmd_run() {
+  load "$1"
+  # systemd doesn't set HOME/USER for system services.
+  HOME=$(getent passwd "$(id -un)" | cut -d: -f6); USER=$(id -un)
+  export HOME USER SHELL=/bin/bash
+  cd "$DIR"
+  if [[ -f $DIR/secrets.env ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$DIR/secrets.env"
+    set +a
+  fi
+  export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 AGENT_NAME=$NAME
+  local args=(--remote-control "$RC_NAME")
+  if [[ $PERMISSION_MODE == bypassPermissions ]]; then
+    args+=(--dangerously-skip-permissions)
+  else
+    args+=(--permission-mode "$PERMISSION_MODE")
+  fi
+  [[ -n $MODEL ]] && args+=(--model "$MODEL")
+  local d
+  for d in $ADD_DIRS; do args+=(--add-dir "$d"); done
+  # Resume the previous conversation after a restart, if there is one.
+  local proj="$HOME/.claude/projects/${DIR//\//-}"
+  if compgen -G "$proj/*.jsonl" >/dev/null; then args+=(--continue); fi
+  exec "$HOME/.local/bin/claude" "${args[@]}"
+}
+
+cmd_say() {
+  load "$1"; shift
+  local msg="$*"
+  [[ -n $msg ]] || die "nothing to say"
+  running || die "$NAME is not running"
+  # One line only: the Claude Code prompt submits on Enter.
+  msg=${msg//$'\n'/ }
+  tmx send-keys -t "$NAME" -l -- "$msg"
+  sleep 0.5
+  tmx send-keys -t "$NAME" Enter
+}
+
+cmd_peek() {
+  load "$1"
+  tmx capture-pane -p -t "$NAME"
+}
+
+cmd_deliver() {
+  shopt -s nullglob
+  local f base from to
+  for f in "$HANDOFF_DIR"/inbox/*.md; do
+    base=$(basename "$f")
+    # Root runs this on files agents wrote: only plain files, never symlinks.
+    if [[ -L $f || ! -f $f ]]; then rm -f "$f"; continue; fi
+    # <timestamp>__<from>__<to>__<kind>.md, written by agent-handoff
+    IFS=_ read -r _ _ from _ to _ kind <<<"${base%.md}"
+    if ! ( load "$to" && running ); then
+      echo "handoff $base: agent '$to' not running, leaving it queued" >&2
+      continue
+    fi
+    mv "$f" "$HANDOFF_DIR/delivered/$base"
+    chmod 640 "$HANDOFF_DIR/delivered/$base"
+    if [[ $kind == result ]]; then
+      cmd_say "$to" "Result from the $from agent for a job you handed over: read $HANDOFF_DIR/delivered/$base. Do not reply to it with agent-handoff; tell the owner if it matters."
+    elif [[ $from == owner ]]; then
+      cmd_say "$to" "Job from the owner: read $HANDOFF_DIR/delivered/$base and do what it asks."
+    else
+      cmd_say "$to" "Handoff from the $from agent: read $HANDOFF_DIR/delivered/$base and do what it asks. When finished, report back once with: agent-handoff --result $from \"<short result>\""
+    fi
+  done
+}
+
+cmd_list() {
+  local d n
+  for d in "$CONF_DIR"/*.env; do
+    n=$(basename "$d" .env)
+    ( load "$n"; printf '%-12s %-18s %-10s %s\n' "$n" "$RC_NAME" "$RUN_AS" "$(running && echo running || echo stopped)" )
+  done
+}
+
+case ${1:-} in
+  start|stop|run|peek) c=$1; shift; "cmd_$c" "$@" ;;
+  say) shift; cmd_say "$@" ;;
+  deliver) cmd_deliver ;;
+  list) cmd_list ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
