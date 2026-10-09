@@ -12,7 +12,10 @@
 # Each agent has a root-owned config /etc/claude-agents/<name>.env (root sources it, so it must
 # never live in a folder the agent's user can write):
 #   RC_NAME (name shown in the Claude app), RUN_AS (user), optional MODEL,
-#   ADD_DIRS (space-separated), PERMISSION_MODE (default bypassPermissions)
+#   ADD_DIRS (space-separated), PERMISSION_MODE (default bypassPermissions),
+#   ENV_VARS (space-separated KEY=VALUE exported into the session, e.g. ENABLE_CLAUDEAI_MCP_SERVERS=false)
+# plus optional /etc/claude-agents/<name>.settings.json (deny rules, MCP approvals), passed with
+# --settings so the agent can't edit them,
 # and a working folder /var/lib/claude-agents/<name>/ owned by RUN_AS with:
 #   secrets.env   optional, mode 600, sourced into the session environment as RUN_AS (never committed)
 #   CLAUDE.md, .mcp.json, .claude/settings.json  the agent's instructions, tools and deny rules
@@ -29,7 +32,7 @@ load() {
   [[ $NAME =~ ^[a-z0-9-]+$ ]] || die "bad agent name: $NAME"
   DIR=$AGENTS_DIR/$NAME
   [[ -f $CONF_DIR/$NAME.env ]] || die "no $CONF_DIR/$NAME.env"
-  RC_NAME=$NAME RUN_AS=root MODEL="" ADD_DIRS="" PERMISSION_MODE=bypassPermissions
+  RC_NAME=$NAME RUN_AS=root MODEL="" ADD_DIRS="" PERMISSION_MODE=bypassPermissions ENV_VARS=""
   # shellcheck source=/dev/null
   source "$CONF_DIR/$NAME.env"
   SOCK=claude-$NAME
@@ -68,6 +71,8 @@ cmd_run() {
     set +a
   fi
   export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 AGENT_NAME=$NAME
+  local kv
+  for kv in $ENV_VARS; do export "${kv?}"; done
   local args=(--remote-control "$RC_NAME")
   if [[ $PERMISSION_MODE == bypassPermissions ]]; then
     args+=(--dangerously-skip-permissions)
@@ -75,6 +80,7 @@ cmd_run() {
     args+=(--permission-mode "$PERMISSION_MODE")
   fi
   [[ -n $MODEL ]] && args+=(--model "$MODEL")
+  [[ -f $CONF_DIR/$NAME.settings.json ]] && args+=(--settings "$CONF_DIR/$NAME.settings.json")
   local d
   for d in $ADD_DIRS; do args+=(--add-dir "$d"); done
   # Resume the previous conversation after a restart, if there is one.
