@@ -117,6 +117,8 @@ cmd_deliver() {
     chmod 640 "$HANDOFF_DIR/delivered/$base"
     if [[ $kind == result ]]; then
       cmd_say "$to" "Result from the $from agent for a job you handed over: read $HANDOFF_DIR/delivered/$base. Do not reply to it with agent-handoff; tell the owner if it matters."
+    elif [[ ! -f $CONF_DIR/$from.env && $from != owner ]]; then
+      cmd_say "$to" "Alert from $from (an automated watcher, not an agent): read $HANDOFF_DIR/delivered/$base and handle it as your CLAUDE.md says. Don't reply with agent-handoff; tell the owner only if they need to know or act."
     elif [[ $from == owner ]]; then
       cmd_say "$to" "Job from the owner: read $HANDOFF_DIR/delivered/$base and do what it asks."
     else
