@@ -115,6 +115,23 @@ base_args() {
   return 0
 }
 
+# Start a task's tmux server in its own systemd scope, so restarting the master agent's unit
+# (claude-agent@<name>.service, whose cgroup the master runs in) doesn't kill its task sessions.
+tmx_task_new() {
+  local uid; uid=$(id -u "$RUN_AS")
+  if [[ $EUID -eq 0 && $RUN_AS != root ]]; then
+    systemd-run --scope --quiet --collect --uid="$RUN_AS" --gid="$(id -g "$RUN_AS")" \
+      --setenv=HOME="$(getent passwd "$RUN_AS" | cut -d: -f6)" -- tmux -L "$SOCK" "$@"
+  elif [[ $EUID -eq 0 ]]; then
+    systemd-run --scope --quiet --collect -- tmux -L "$SOCK" "$@"
+  elif [[ -S /run/user/$uid/bus ]]; then
+    XDG_RUNTIME_DIR=/run/user/$uid systemd-run --user --scope --quiet --collect -- tmux -L "$SOCK" "$@"
+  else
+    echo "claude-agent: no user systemd (enable linger for $RUN_AS); task will die with the master" >&2
+    tmux -L "$SOCK" "$@"
+  fi
+}
+
 cmd_start() {
   load "$1"
   [[ -z $TASK_ID ]] || die "$SESSION is a task session; start tasks with: claude-agent task $NAME ..."
@@ -293,7 +310,7 @@ cmd_task() {
   local pf
   pf=$(as_user mktemp /tmp/claude-task.XXXXXX)
   printf '%s\n' "$full" | as_user tee "$pf" >/dev/null
-  if ! tmx new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "$pf"; then
+  if ! tmx_task_new new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "$pf"; then
     as_user rm -f "$pf"; die "tmux new-session failed"
   fi
   tmx set-option -t "=$SESSION:" history-limit 20000 >/dev/null
@@ -310,11 +327,34 @@ cmd_task_run() {
   load "$1"
   [[ -n $TASK_ID ]] || die "task-run needs a task session name"
   local title=$2 model=$3 pf=$4 prompt
+  if [[ $pf == --continue ]]; then
+    session_env
+    base_args "$model"
+    exec "$HOME/.local/bin/claude" --remote-control "$RC_NAME · $title" "${ARGS[@]}" --continue
+  fi
   [[ -f $pf ]] || die "no prompt file $pf"
   prompt=$(cat "$pf"); rm -f "$pf"
   session_env
   base_args "$model"
   exec "$HOME/.local/bin/claude" --remote-control "$RC_NAME · $title" "${ARGS[@]}" -- "$prompt"
+}
+
+# claude-agent resume <agent>-t-<id> "<title>" [model]: restart a dead task session in its worktree,
+# continuing its previous conversation (e.g. after a reboot).
+cmd_resume() {
+  load "$1"
+  [[ -n $TASK_ID ]] || die "resume needs a task session name (<agent>-t-<id>)"
+  local title=${2:?title required} model=${3:-$TASK_MODEL} wt
+  wt=${TASK_WORKTREES:-$DIR/worktrees}/$SESSION
+  [[ -d $wt ]] || wt=$DIR
+  running && die "$SESSION is already running"
+  as_user rm -f "/tmp/tmux-$(id -u "$RUN_AS")/$SOCK"
+  tmx_task_new new-session -d -s "$SESSION" -x 200 -y 50 -c "$wt" "$SELF" task-run "$SESSION" "$title" "$model" --continue
+  tmx set-option -t "=$SESSION:" history-limit 20000 >/dev/null
+  tmx set-option -t "=$SESSION:" @task_title "$title" >/dev/null
+  tmx set-option -t "=$SESSION:" @task_model "$model" >/dev/null
+  tmx set-option -t "=$SESSION:" @task_branch "$(as_user git -C "$wt" branch --show-current 2>/dev/null)" >/dev/null
+  echo "resumed $SESSION ($RC_NAME · $title) in $wt"
 }
 
 # Echo the task ids that have a tmux socket for the current $NAME/$RUN_AS.
@@ -384,7 +424,7 @@ stop_task() {
 }
 
 case ${1:-} in
-  start|stop|run|peek|task|tasks) c=$1; shift; "cmd_$c" "$@" ;;
+  start|stop|run|peek|task|tasks|resume) c=$1; shift; "cmd_$c" "$@" ;;
   task-run) shift; cmd_task_run "$@" ;;
   say) shift; cmd_say "$@" ;;
   deliver) cmd_deliver ;;
