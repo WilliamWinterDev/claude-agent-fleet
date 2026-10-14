@@ -119,9 +119,11 @@ base_args() {
 # (claude-agent@<name>.service, whose cgroup the master runs in) doesn't kill its task sessions.
 tmx_task_new() {
   local uid; uid=$(id -u "$RUN_AS")
-  if [[ $EUID -eq 0 && $RUN_AS != root ]]; then
-    systemd-run --scope --quiet --collect --uid="$RUN_AS" --gid="$(id -g "$RUN_AS")" \
-      --setenv=HOME="$(getent passwd "$RUN_AS" | cut -d: -f6)" -- tmux -L "$SOCK" "$@"
+  if [[ $EUID -eq 0 && $RUN_AS != root && -S /run/user/$uid/bus ]]; then
+    # via the user's own systemd so the session keeps its supplementary groups (e.g. agents,
+    # needed to write the handoff inbox); systemd-run --uid would drop them
+    runuser -u "$RUN_AS" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+      systemd-run --user --scope --quiet --collect -- tmux -L "$SOCK" "$@"
   elif [[ $EUID -eq 0 ]]; then
     systemd-run --scope --quiet --collect -- tmux -L "$SOCK" "$@"
   elif [[ -S /run/user/$uid/bus ]]; then
