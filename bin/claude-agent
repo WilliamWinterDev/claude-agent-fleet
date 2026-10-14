@@ -2,18 +2,37 @@
 # claude-agent: run always-on Claude Code Remote Control agents on a Linux host, one tmux session each.
 #
 #   claude-agent start <name>      start the agent's tmux session (used by claude-agent@<name>.service)
-#   claude-agent stop <name>       stop it
+#   claude-agent stop <name>       stop it (<agent>-t-<id>: end that task session, see below)
 #   claude-agent run <name>        (inside tmux) exec claude with the agent's settings
 #   claude-agent say <name> <msg>  type a prompt into the running session (routines, handoffs)
 #   claude-agent peek <name>       print the visible screen of the session
 #   claude-agent deliver           deliver queued handoffs from /var/lib/claude-agents/handoffs/inbox
 #   claude-agent list              show agents and whether they're running
+#   claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--dry-run] "<prompt>"
+#                                  start a NEW Remote Control session for one task (see below)
+#   claude-agent tasks [<agent>]   list running task sessions
+#   claude-agent stop <agent>-t-<id> [--keep-worktree]
+#                                  end a task session (kill-session on that exact session; removes
+#                                  its worktree if clean, keeps the branch)
+#
+# Task sessions: a standing "master" agent dispatches one session per task so each task's context
+# lives in its own session. `task` runs as the agent's RUN_AS user with the agent's permission mode,
+# settings file, secrets and ENV_VARS (same code as `run`), in its own tmux server (socket
+# claude-<agent>-t-<id>, session <agent>-t-<id>) so restarting the master never kills tasks. The
+# session is `claude --remote-control "<RC_NAME> · <title>"` with the prompt (plus a short preamble)
+# as its initial prompt. With a repo (--repo, or TASK_REPO) it starts in a fresh git worktree on
+# branch task/<id>-<slug>, which also groups it under that repo in the Claude app; otherwise it
+# starts in /var/lib/claude-agents/<agent>. peek/say work on <agent>-t-<id> too. Root or the agent's own user
+# can run task/tasks/stop for that agent (no sudo needed for an agent to start its own tasks).
+# Optional task vars in the env file: TASK_MODEL (default sonnet), TASK_REPO, TASK_WORKTREES
+# (default /var/lib/claude-agents/<name>/worktrees).
 #
 # Each agent has a root-owned config /etc/claude-agents/<name>.env (root sources it, so it must
 # never live in a folder the agent's user can write):
 #   RC_NAME (name shown in the Claude app), RUN_AS (user), optional MODEL,
 #   ADD_DIRS (space-separated), PERMISSION_MODE (default bypassPermissions),
 #   ENV_VARS (space-separated KEY=VALUE exported into the session, e.g. ENABLE_CLAUDEAI_MCP_SERVERS=false)
+#   TASK_MODEL, TASK_REPO, TASK_WORKTREES (task sessions, above)
 # plus optional /etc/claude-agents/<name>.settings.json (deny rules, MCP approvals), passed with
 # --settings so the agent can't edit them,
 # and a working folder /var/lib/claude-agents/<name>/ owned by RUN_AS with:
@@ -27,43 +46,48 @@ HANDOFF_DIR=$AGENTS_DIR/handoffs
 
 die() { echo "claude-agent: $*" >&2; exit 1; }
 
+
+SELF=/usr/local/bin/claude-agent
+
+# load <agent | agent-t-id>: read the agent's config. For a task session name, NAME is still the
+# agent; TASK_ID is set and SESSION/SOCK point at the task's own tmux server.
 load() {
   NAME=${1:?agent name required}
   [[ $NAME =~ ^[a-z0-9-]+$ ]] || die "bad agent name: $NAME"
+  TASK_ID=""
+  if [[ ! -f $CONF_DIR/$NAME.env && $NAME =~ ^([a-z0-9-]+)-t-([0-9a-f]{6})$ ]]; then
+    TASK_ID=${BASH_REMATCH[2]}; NAME=${BASH_REMATCH[1]}
+  fi
   DIR=$AGENTS_DIR/$NAME
   [[ -f $CONF_DIR/$NAME.env ]] || die "no $CONF_DIR/$NAME.env"
   RC_NAME=$NAME RUN_AS=root MODEL="" ADD_DIRS="" PERMISSION_MODE=bypassPermissions ENV_VARS=""
+  TASK_MODEL=sonnet TASK_REPO="" TASK_WORKTREES=""
   # shellcheck source=/dev/null
   source "$CONF_DIR/$NAME.env"
-  SOCK=claude-$NAME
+  if [[ -n $TASK_ID ]]; then SESSION=$NAME-t-$TASK_ID; else SESSION=$NAME; fi
+  SOCK=claude-$SESSION
 }
 
+# Run a command as the agent's user: via runuser from root, directly if we already are that user.
 as_user() {
-  if [[ $RUN_AS == root ]]; then "$@"; else runuser -u "$RUN_AS" -- "$@"; fi
+  if [[ $(id -un) == "$RUN_AS" ]]; then "$@"
+  elif [[ $EUID -eq 0 ]]; then runuser -u "$RUN_AS" -- "$@"
+  else die "must run as root or $RUN_AS for agent $NAME"
+  fi
 }
 
-tmx() { as_user tmux -L "$SOCK" "$@"; }
+# TMUX is unset so this also works when called from inside an agent's own tmux session.
+tmx() { as_user env -u TMUX tmux -L "$SOCK" "$@"; }
 
-running() { tmx has-session -t "$NAME" 2>/dev/null; }
+# "=" makes tmux match the session name exactly, never as a prefix (web vs web-t-ab12cd).
+running() { tmx has-session -t "=$SESSION" 2>/dev/null; }
 
-cmd_start() {
-  load "$1"
-  running && { echo "$NAME already running"; return 0; }
-  tmx new-session -d -s "$NAME" -x 200 -y 50 -c "$DIR" "/usr/local/bin/claude-agent run $NAME"
-  tmx set-option -t "$NAME" history-limit 20000 >/dev/null
-}
-
-cmd_stop() {
-  load "$1"
-  tmx kill-server 2>/dev/null || true
-}
-
-cmd_run() {
-  load "$1"
+# Session environment shared by `run` and `task-run`: HOME/USER, secrets.env, ENV_VARS.
+# Call as the agent's user, inside tmux.
+session_env() {
   # systemd doesn't set HOME/USER for system services.
   HOME=$(getent passwd "$(id -un)" | cut -d: -f6); USER=$(id -un)
   export HOME USER SHELL=/bin/bash
-  cd "$DIR"
   if [[ -f $DIR/secrets.env ]]; then
     set -a
     # shellcheck source=/dev/null
@@ -73,16 +97,45 @@ cmd_run() {
   export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 AGENT_NAME=$NAME
   local kv
   for kv in $ENV_VARS; do export "${kv?}"; done
-  local args=(--remote-control "$RC_NAME")
+}
+
+# Fill ARGS with the claude flags shared by `run` and `task-run`: permission mode, model
+# ($1, may be empty), the root-owned settings file and ADD_DIRS.
+base_args() {
+  ARGS=()
   if [[ $PERMISSION_MODE == bypassPermissions ]]; then
-    args+=(--dangerously-skip-permissions)
+    ARGS+=(--dangerously-skip-permissions)
   else
-    args+=(--permission-mode "$PERMISSION_MODE")
+    ARGS+=(--permission-mode "$PERMISSION_MODE")
   fi
-  [[ -n $MODEL ]] && args+=(--model "$MODEL")
-  [[ -f $CONF_DIR/$NAME.settings.json ]] && args+=(--settings "$CONF_DIR/$NAME.settings.json")
+  [[ -n ${1:-} ]] && ARGS+=(--model "$1")
+  [[ -f $CONF_DIR/$NAME.settings.json ]] && ARGS+=(--settings "$CONF_DIR/$NAME.settings.json")
   local d
-  for d in $ADD_DIRS; do args+=(--add-dir "$d"); done
+  for d in $ADD_DIRS; do ARGS+=(--add-dir "$d"); done
+  return 0
+}
+
+cmd_start() {
+  load "$1"
+  [[ -z $TASK_ID ]] || die "$SESSION is a task session; start tasks with: claude-agent task $NAME ..."
+  running && { echo "$NAME already running"; return 0; }
+  tmx new-session -d -s "$NAME" -x 200 -y 50 -c "$DIR" "$SELF run $NAME"
+  tmx set-option -t "=$NAME:" history-limit 20000 >/dev/null
+}
+
+cmd_stop() {
+  load "$1"
+  if [[ -n $TASK_ID ]]; then stop_task "${2:-}"; return; fi
+  tmx kill-server 2>/dev/null || true
+}
+
+cmd_run() {
+  load "$1"
+  [[ -z $TASK_ID ]] || die "run is for standing agents"
+  session_env
+  cd "$DIR"
+  base_args "$MODEL"
+  local args=(--remote-control "$RC_NAME" "${ARGS[@]}")
   # Resume the previous conversation after a restart, if there is one.
   local proj="$HOME/.claude/projects/${DIR//\//-}"
   if compgen -G "$proj/*.jsonl" >/dev/null; then args+=(--continue); fi
@@ -93,17 +146,17 @@ cmd_say() {
   load "$1"; shift
   local msg="$*"
   [[ -n $msg ]] || die "nothing to say"
-  running || die "$NAME is not running"
+  running || die "$SESSION is not running"
   # One line only: the Claude Code prompt submits on Enter.
   msg=${msg//$'\n'/ }
-  tmx send-keys -t "$NAME" -l -- "$msg"
+  tmx send-keys -t "=$SESSION:" -l -- "$msg"
   sleep 0.5
-  tmx send-keys -t "$NAME" Enter
+  tmx send-keys -t "=$SESSION:" Enter
 }
 
 cmd_peek() {
   load "$1"
-  tmx capture-pane -p -t "$NAME"
+  tmx capture-pane -p -t "=$SESSION:"
 }
 
 cmd_deliver() {
@@ -141,10 +194,199 @@ cmd_list() {
   done
 }
 
+# ---- task sessions -------------------------------------------------------------------------
+
+short_id() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n'; }
+
+slugify() {
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30)
+  s=${s%-}
+  printf '%s' "${s:-task}"
+}
+
+# Print a command (first word is a raw label), quoted so it can be pasted into a shell.
+show() { printf '  %s ' "$1"; shift; printf '%q ' "$@"; printf '\n'; }
+
+cmd_task() {
+  local agent=${1:-}; shift || true
+  [[ -n $agent ]] || die 'usage: claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--dry-run] "<prompt>"'
+  local repo="" model="" title="" dry=0 prompt=""
+  while (($#)); do
+    case $1 in
+      --repo) repo=${2:?--repo needs a path}; shift 2 ;;
+      --model) model=${2:?--model needs a value}; shift 2 ;;
+      --name) title=${2:?--name needs a title}; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      --) shift; prompt=$*; break ;;
+      -*) die "unknown option: $1" ;;
+      *) prompt=$*; break ;;
+    esac
+  done
+  [[ -n $prompt ]] || prompt=$(cat)
+  [[ -n $prompt ]] || die "empty task prompt"
+  load "$agent"
+  [[ -z $TASK_ID ]] || die "give the agent name, not a task session: $agent"
+  [[ -d $DIR ]] || die "no $DIR"
+  [[ -n $model ]] || model=$TASK_MODEL
+  [[ $model =~ ^[A-Za-z0-9] && $model != *[[:space:]]* ]] || die "bad model: $model"
+  [[ -n $repo ]] || repo=$TASK_REPO
+
+  if [[ -z $title ]]; then
+    title=$(printf '%s' "$prompt" | head -n1 | tr -s '[:space:]' ' ' | cut -d' ' -f1-6)
+  fi
+  title=$(printf '%s' "$title" | tr -d '[:cntrl:]' | cut -c1-40)
+  [[ -n $title ]] || title=task
+
+  local id slug
+  id=$(short_id); slug=$(slugify "$title")
+  # Reuse the session name check so an id can never collide with a live task.
+  SESSION=$NAME-t-$id; SOCK=claude-$SESSION
+  local rcname="$RC_NAME · $title"
+
+  local workdir=$DIR branch="" base="" wt="" repo_abs=""
+  if [[ -n $repo ]]; then
+    repo_abs=$(as_user realpath -e -- "$repo" 2>/dev/null) || die "repo not found (as $RUN_AS): $repo"
+    as_user git -C "$repo_abs" rev-parse --git-dir >/dev/null 2>&1 \
+      || die "not a git repo (as $RUN_AS): $repo_abs"
+    branch=task/$id-$slug
+    wt=${TASK_WORKTREES:-$DIR/worktrees}/$SESSION
+    base=$(as_user git -C "$repo_abs" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo HEAD)
+    workdir=$wt
+  fi
+
+  # Preamble + prompt, written to a private file that task-run reads and deletes.
+  local pre="You are a task session for the $NAME agent ($RC_NAME), started with claude-agent task."
+  if [[ -n $branch ]]; then
+    pre+=" You are in $workdir, a git worktree of $repo_abs on branch $branch: keep all work on this branch, open a PR with gh pr create, and never push to main."
+  else
+    pre+=" You are in $workdir. If you change a repo, work on a branch and open a PR; never push to main."
+  fi
+  pre+=" Standing rules for this agent are in $DIR/CLAUDE.md. Do only the task below. When it is done, report once with: agent-handoff --result $NAME \"<short result, PR link if any>\" and then stop and wait. If you are blocked, ask the owner here rather than guessing."
+  local full="$pre"$'\n\n'"Task:"$'\n'"$prompt"
+
+  if ((dry)); then
+    echo "DRY RUN (nothing created). agent=$NAME run_as=$RUN_AS session=$SESSION socket=$SOCK"
+    echo "RC name: $rcname   model: $model   permission-mode: $PERMISSION_MODE"
+    if [[ -n $repo_abs ]]; then
+      echo "worktree: $wt (branch $branch from $base of $repo_abs)"
+      show "[as $RUN_AS]" git -C "$repo_abs" fetch -q origin
+      show "[as $RUN_AS]" git -C "$repo_abs" worktree add -b "$branch" "$wt" "$base"
+    else
+      echo "worktree: none, cwd $workdir"
+    fi
+    echo "tmux:"
+    show "[as $RUN_AS]" tmux -L "$SOCK" new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "<promptfile>"
+    base_args "$model"
+    echo "claude (in $workdir, after session_env: HOME, secrets.env, ENV_VARS=$(printf '%s' "$ENV_VARS" | sed -E 's/=[^ ]*/=.../g')):"
+    show "\$HOME/.local/bin/claude" --remote-control "$rcname" "${ARGS[@]}" -- "<prompt>"
+    echo "prompt (${#full} chars):"; printf '%s\n' "$full" | sed 's/^/  | /'
+    return 0
+  fi
+
+  running && die "session $SESSION already exists, retry"
+  if [[ -n $repo_abs ]]; then
+    as_user mkdir -p "$(dirname "$wt")"
+    as_user timeout 30 git -C "$repo_abs" fetch -q origin 2>/dev/null || true
+    as_user git -C "$repo_abs" worktree add -q -b "$branch" "$wt" "$base" || die "worktree add failed"
+  fi
+  local pf
+  pf=$(as_user mktemp /tmp/claude-task.XXXXXX)
+  printf '%s\n' "$full" | as_user tee "$pf" >/dev/null
+  if ! tmx new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "$pf"; then
+    as_user rm -f "$pf"; die "tmux new-session failed"
+  fi
+  tmx set-option -t "=$SESSION:" history-limit 20000 >/dev/null
+  tmx set-option -t "=$SESSION:" @task_title "$title" >/dev/null
+  tmx set-option -t "=$SESSION:" @task_model "$model" >/dev/null
+  tmx set-option -t "=$SESSION:" @task_branch "$branch" >/dev/null
+  tmx set-option -t "=$SESSION:" @task_dir "$workdir" >/dev/null
+  tmx set-option -t "=$SESSION:" @task_repo "$repo_abs" >/dev/null
+  echo "started $SESSION ($rcname, $model) in $workdir${branch:+ on $branch}"
+}
+
+# Inside tmux: exec claude for a task. $1 session, $2 title, $3 model, $4 prompt file.
+cmd_task_run() {
+  load "$1"
+  [[ -n $TASK_ID ]] || die "task-run needs a task session name"
+  local title=$2 model=$3 pf=$4 prompt
+  [[ -f $pf ]] || die "no prompt file $pf"
+  prompt=$(cat "$pf"); rm -f "$pf"
+  session_env
+  base_args "$model"
+  exec "$HOME/.local/bin/claude" --remote-control "$RC_NAME · $title" "${ARGS[@]}" -- "$prompt"
+}
+
+# Echo the task ids that have a tmux socket for the current $NAME/$RUN_AS.
+task_ids() {
+  local dir f id uid
+  uid=$(id -u "$RUN_AS")
+  dir=/tmp/tmux-$uid
+  for f in "$dir"/claude-"$NAME"-t-*; do
+    [[ -S $f ]] || continue
+    id=${f##*-t-}
+    [[ $id =~ ^[0-9a-f]{6}$ ]] && echo "$id"
+  done
+  return 0
+}
+
+print_tasks() {
+  local id fmt
+  fmt='#{session_name}|#{session_created}|#{@task_model}|#{@task_branch}|#{@task_title}'
+  for id in $(task_ids); do
+    SESSION=$NAME-t-$id; SOCK=claude-$SESSION
+    tmx list-sessions -F "$fmt" 2>/dev/null | while IFS='|' read -r sn created m b t; do
+      printf '%-22s %-8s %-9s %-34s %s\n' "$sn" "$(age "$created")" "$m" "${b:--}" "$t"
+    done
+  done
+}
+
+age() {
+  local d=$(( $(date +%s) - $1 ))
+  if (( d >= 86400 )); then echo "$((d / 86400))d"; elif (( d >= 3600 )); then echo "$((d / 3600))h"; else echo "$((d / 60))m"; fi
+}
+
+cmd_tasks() {
+  local n
+  printf '%-22s %-8s %-9s %-34s %s\n' SESSION AGE MODEL BRANCH TITLE
+  if [[ -n ${1:-} ]]; then ( load "$1"; print_tasks ); return; fi
+  for d in "$CONF_DIR"/*.env; do
+    n=$(basename "$d" .env)
+    # A non-root caller can only see its own user's agents.
+    ( load "$n"; [[ $EUID -eq 0 || $(id -un) == "$RUN_AS" ]] && print_tasks ) || true
+  done
+}
+
+# End one task session. Kills exactly that tmux session (never pkill), then removes its worktree if
+# clean (the branch stays). Called by cmd_stop with $SESSION/$TASK_ID set.
+stop_task() {
+  local keep=0
+  [[ ${1:-} == --keep-worktree ]] && keep=1
+  local wt common
+  wt=${TASK_WORKTREES:-$DIR/worktrees}/$SESSION
+  if running; then
+    tmx kill-session -t "=$SESSION"
+    echo "stopped $SESSION"
+  else
+    echo "$SESSION is not running"
+  fi
+  [[ $keep -eq 0 && -e $wt/.git ]] || return 0
+  # The worktree knows its repo; no state to keep elsewhere.
+  common=$(as_user git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  sleep 1
+  # No --force: git refuses if there are uncommitted or untracked changes.
+  if as_user git -C "$common" worktree remove "$wt" 2>/dev/null; then
+    echo "removed clean worktree $wt (branch kept)"
+  else
+    echo "kept worktree $wt (has changes); remove later with: git -C $common worktree remove $wt" >&2
+  fi
+}
+
 case ${1:-} in
-  start|stop|run|peek) c=$1; shift; "cmd_$c" "$@" ;;
+  start|stop|run|peek|task|tasks) c=$1; shift; "cmd_$c" "$@" ;;
+  task-run) shift; cmd_task_run "$@" ;;
   say) shift; cmd_say "$@" ;;
   deliver) cmd_deliver ;;
   list) cmd_list ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,/^# Each agent/{/^# Each agent/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
