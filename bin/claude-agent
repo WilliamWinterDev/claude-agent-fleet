@@ -337,7 +337,7 @@ print_tasks() {
     SESSION=$NAME-t-$id; SOCK=claude-$SESSION
     tmx list-sessions -F "$fmt" 2>/dev/null | while IFS='|' read -r sn created m b t; do
       printf '%-22s %-8s %-9s %-34s %s\n' "$sn" "$(age "$created")" "$m" "${b:--}" "$t"
-    done
+    done || true  # stale socket of a stopped task: skip it rather than abort the listing
   done
 }
 
@@ -366,6 +366,7 @@ stop_task() {
   wt=${TASK_WORKTREES:-$DIR/worktrees}/$SESSION
   if running; then
     tmx kill-session -t "=$SESSION"
+    as_user rm -f "/tmp/tmux-$(id -u "$RUN_AS")/$SOCK"  # tmux can leave the socket behind
     echo "stopped $SESSION"
   else
     echo "$SESSION is not running"
