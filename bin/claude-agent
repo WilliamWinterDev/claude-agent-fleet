@@ -60,6 +60,14 @@ HANDOFF_DIR=$AGENTS_DIR/handoffs
 
 die() { echo "claude-agent: $*" >&2; exit 1; }
 
+# ev_log <event> <agent> <task-id> <kind task|fix> <title>: append one TSV line (epoch, event, agent,
+# task, kind, title) to $EVENT_LOG for the agent-metrics exporter. Events: task_start, fix_start,
+# resume, stop. Best effort: a write failure (or a missing log dir) never affects the command.
+EVENT_LOG=${CLAUDE_AGENT_EVENT_LOG:-/var/log/claude-agent/events.log}
+ev_log() {
+  { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" "$4" "$(printf '%s' "$5" | tr '\t\n\r' '   ')" >> "$EVENT_LOG"; } 2>/dev/null || true
+}
+
 
 SELF=/usr/local/bin/claude-agent
 
@@ -391,6 +399,7 @@ cmd_task() {
   tmx set-option -t "=$SESSION:" @task_branch "$branch" >/dev/null
   tmx set-option -t "=$SESSION:" @task_dir "$workdir" >/dev/null
   tmx set-option -t "=$SESSION:" @task_repo "$repo_abs" >/dev/null
+  ev_log "$( ((fix)) && echo fix_start || echo task_start )" "$NAME" "$id" "$( ((fix)) && echo fix || echo task )" "$title"
   echo "started $SESSION ($rcname, $model) in $workdir${branch:+ on $branch}"
 }
 
@@ -435,6 +444,7 @@ cmd_resume() {
   tmx set-option -t "=$SESSION:" @task_model "$model" >/dev/null
   ((fix)) && tmx set-option -t "=$SESSION:" @task_fix 1 >/dev/null
   tmx set-option -t "=$SESSION:" @task_branch "$(as_user git -C "$wt" branch --show-current 2>/dev/null)" >/dev/null
+  ev_log resume "$NAME" "$TASK_ID" "$( ((fix)) && echo fix || echo task )" "$title"
   echo "resumed $SESSION ($RC_NAME · $title) in $wt"
 }
 
@@ -486,7 +496,11 @@ stop_task() {
   local wt common
   wt=${TASK_WORKTREES:-$DIR/worktrees}/$SESSION
   if running; then
+    local ev_title ev_fix
+    ev_title=$(tmx show-options -t "=$SESSION:" -qv @task_title 2>/dev/null || true)
+    ev_fix=$(tmx show-options -t "=$SESSION:" -qv @task_fix 2>/dev/null || true)
     tmx kill-session -t "=$SESSION"
+    ev_log stop "$NAME" "$TASK_ID" "$([[ $ev_fix == 1 ]] && echo fix || echo task)" "$ev_title"
     as_user rm -f "/tmp/tmux-$(id -u "$RUN_AS")/$SOCK"  # tmux can leave the socket behind
     echo "stopped $SESSION"
   else
