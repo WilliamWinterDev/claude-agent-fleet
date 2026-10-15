@@ -8,9 +8,11 @@
 #   claude-agent peek <name>       print the visible screen of the session
 #   claude-agent deliver           deliver queued handoffs from /var/lib/claude-agents/handoffs/inbox
 #   claude-agent list              show agents and whether they're running
-#   claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--dry-run] "<prompt>"
+#   claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--fix] [--dry-run] "<prompt>"
 #                                  start a NEW Remote Control session for one task (see below)
-#   claude-agent tasks [<agent>]   list running task sessions
+#   claude-agent tasks [<agent>]   list running task sessions (FIX column: Y for the fix session)
+#   claude-agent resume <agent>-t-<id> "<title>" [model] [--fix]
+#                                  restart a dead task session, continuing its conversation
 #   claude-agent stop <agent>-t-<id> [--keep-worktree]
 #                                  end a task session (kill-session on that exact session; removes
 #                                  its worktree if clean, keeps the branch)
@@ -24,6 +26,18 @@
 # branch task/<id>-<slug>, which also groups it under that repo in the Claude app; otherwise it
 # starts in /var/lib/claude-agents/<agent>. peek/say work on <agent>-t-<id> too. Root or the agent's own user
 # can run task/tasks/stop for that agent (no sudo needed for an agent to start its own tasks).
+#
+# Fix sessions (`task --fix`): the "fix agent" for a failed e2e run on main (started by a CI watcher).
+# Title is prefixed "Fix:", the tmux session is marked @task_fix=1, it is exempt from TASK_MAX, and
+# it is refused while another fix session of that agent is running (one at a time). `resume` keeps
+# the flag (a title starting "Fix:" or --fix).
+# Who may run e2e is decided by which --settings file a session gets, two root-owned files:
+#   /etc/claude-agents/<name>.settings.json       base deny rules; used by FIX sessions
+#   /etc/claude-agents/<name>.task-settings.json  base denies plus the e2e denies; used by the standing
+#                                                 master and normal task sessions (when the file exists;
+#                                                 agents without one use <name>.settings.json for all)
+# A master picks the change up on its next restart; running sessions keep what they started with.
+#
 # Optional task vars in the env file: TASK_MODEL (default sonnet), TASK_REPO, TASK_WORKTREES
 # (default /var/lib/claude-agents/<name>/worktrees).
 #
@@ -99,8 +113,18 @@ session_env() {
   for kv in $ENV_VARS; do export "${kv?}"; done
 }
 
+# Settings file for a session: fix sessions ($FIX=1) get <name>.settings.json, everything else gets
+# <name>.task-settings.json when it exists (it adds the e2e denies), else <name>.settings.json.
+FIX=0
+settings_file() {
+  local f=$CONF_DIR/$NAME.settings.json
+  if [[ $FIX -ne 1 && -f $CONF_DIR/$NAME.task-settings.json ]]; then f=$CONF_DIR/$NAME.task-settings.json; fi
+  [[ -f $f ]] && printf '%s' "$f"
+  return 0
+}
+
 # Fill ARGS with the claude flags shared by `run` and `task-run`: permission mode, model
-# ($1, may be empty), the root-owned settings file and ADD_DIRS.
+# ($1, may be empty), the root-owned settings file (see settings_file) and ADD_DIRS.
 base_args() {
   ARGS=()
   if [[ $PERMISSION_MODE == bypassPermissions ]]; then
@@ -109,7 +133,8 @@ base_args() {
     ARGS+=(--permission-mode "$PERMISSION_MODE")
   fi
   [[ -n ${1:-} ]] && ARGS+=(--model "$1")
-  [[ -f $CONF_DIR/$NAME.settings.json ]] && ARGS+=(--settings "$CONF_DIR/$NAME.settings.json")
+  local sf; sf=$(settings_file)
+  [[ -n $sf ]] && ARGS+=(--settings "$sf")
   local d
   for d in $ADD_DIRS; do ARGS+=(--add-dir "$d"); done
   return 0
@@ -134,17 +159,38 @@ tmx_task_new() {
   fi
 }
 
-# TASK_MAX (env file, 0 = no limit): refuse to start or resume a task session when that many of the
+# TASK_MAX (env file, 0 = no limit; fix sessions don't count): refuse to start or resume a task session when that many of the
 # agent's tasks are already running. Enforced here, not left to the agent's instructions.
 check_task_max() {
   [[ ${TASK_MAX:-0} -gt 0 ]] || return 0
   local n=0 id sess=$SESSION sock=$SOCK
   for id in $(task_ids); do
     SESSION=$NAME-t-$id; SOCK=claude-$SESSION
-    running && n=$((n + 1))
+    # a fix session is exempt from the cap and doesn't use up a normal task's slot
+    if running && ! is_fix_session "$SESSION"; then n=$((n + 1)); fi
   done
   SESSION=$sess; SOCK=$sock
   (( n < TASK_MAX )) || die "$NAME already has $n of $TASK_MAX task sessions running; stop or finish one first (claude-agent tasks $NAME)"
+}
+
+# Is the task session $1 (full name) a fix session? Reads the tmux marker; call with $NAME/$RUN_AS set.
+is_fix_session() {
+  local sess=$SESSION sock=$SOCK v
+  SESSION=$1; SOCK=claude-$1
+  v=$(tmx show-options -v -t "=$SESSION:" @task_fix 2>/dev/null || true)
+  SESSION=$sess; SOCK=$sock
+  [[ $v == 1 ]]
+}
+
+# Refuse when a fix session of this agent is already running (only one at a time).
+check_no_fix() {
+  local id sess=$SESSION sock=$SOCK found=""
+  for id in $(task_ids); do
+    SESSION=$NAME-t-$id; SOCK=claude-$SESSION
+    if running && is_fix_session "$SESSION"; then found=$SESSION; break; fi
+  done
+  SESSION=$sess; SOCK=$sock
+  [[ -z $found ]] || die "a fix session for $NAME is already running ($found); only one at a time"
 }
 
 cmd_start() {
@@ -242,13 +288,14 @@ show() { printf '  %s ' "$1"; shift; printf '%q ' "$@"; printf '\n'; }
 
 cmd_task() {
   local agent=${1:-}; shift || true
-  [[ -n $agent ]] || die 'usage: claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--dry-run] "<prompt>"'
-  local repo="" model="" title="" dry=0 prompt=""
+  [[ -n $agent ]] || die 'usage: claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--fix] [--dry-run] "<prompt>"'
+  local repo="" model="" title="" dry=0 prompt="" fix=0
   while (($#)); do
     case $1 in
       --repo) repo=${2:?--repo needs a path}; shift 2 ;;
       --model) model=${2:?--model needs a value}; shift 2 ;;
       --name) title=${2:?--name needs a title}; shift 2 ;;
+      --fix) fix=1; shift ;;
       --dry-run) dry=1; shift ;;
       --) shift; prompt=$*; break ;;
       -*) die "unknown option: $1" ;;
@@ -267,8 +314,10 @@ cmd_task() {
   if [[ -z $title ]]; then
     title=$(printf '%s' "$prompt" | head -n1 | tr -s '[:space:]' ' ' | cut -d' ' -f1-6)
   fi
+  if ((fix)) && [[ $title != Fix:* ]]; then title="Fix: $title"; fi
   title=$(printf '%s' "$title" | tr -d '[:cntrl:]' | cut -c1-40)
   [[ -n $title ]] || title=task
+  FIX=$fix
 
   local id slug
   id=$(short_id); slug=$(slugify "$title")
@@ -294,12 +343,18 @@ cmd_task() {
   else
     pre+=" You are in $workdir. If you change a repo, work on a branch and open a PR; never push to main."
   fi
+  if ((fix)); then
+    pre+=" You are the FIX session: the only session allowed to run the end-to-end suite, because it failed on main. Only one fix session runs at a time."
+  else
+    pre+=" You must not run the end-to-end suite (it is denied for task sessions): use unit tests; e2e runs on every merge to main and a fix session handles failures."
+  fi
   pre+=" Standing rules for this agent are in $DIR/CLAUDE.md. Do only the task below. When it is done, report once with: agent-handoff --result $NAME \"<short result, PR link if any>\" and then stop and wait. If you are blocked, ask the owner here rather than guessing."
   local full="$pre"$'\n\n'"Task:"$'\n'"$prompt"
 
   if ((dry)); then
     echo "DRY RUN (nothing created). agent=$NAME run_as=$RUN_AS session=$SESSION socket=$SOCK"
-    echo "RC name: $rcname   model: $model   permission-mode: $PERMISSION_MODE"
+    echo "RC name: $rcname   model: $model   permission-mode: $PERMISSION_MODE   fix: $fix (settings: $(settings_file || true))"
+    if ((fix)) && ( check_no_fix ) 2>/dev/null; then :; elif ((fix)); then echo "NOTE: a real run would be refused: a fix session is already running"; fi
     if [[ -n $repo_abs ]]; then
       echo "worktree: $wt (branch $branch from $base of $repo_abs)"
       show "[as $RUN_AS]" git -C "$repo_abs" fetch -q origin
@@ -308,7 +363,7 @@ cmd_task() {
       echo "worktree: none, cwd $workdir"
     fi
     echo "tmux:"
-    show "[as $RUN_AS]" tmux -L "$SOCK" new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "<promptfile>"
+    show "[as $RUN_AS]" tmux -L "$SOCK" new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "<promptfile>" "$fix"
     base_args "$model"
     echo "claude (in $workdir, after session_env: HOME, secrets.env, ENV_VARS=$(printf '%s' "$ENV_VARS" | sed -E 's/=[^ ]*/=.../g')):"
     show "\$HOME/.local/bin/claude" --remote-control "$rcname" "${ARGS[@]}" -- "<prompt>"
@@ -317,7 +372,7 @@ cmd_task() {
   fi
 
   running && die "session $SESSION already exists, retry"
-  check_task_max
+  if ((fix)); then check_no_fix; else check_task_max; fi
   if [[ -n $repo_abs ]]; then
     as_user mkdir -p "$(dirname "$wt")"
     as_user timeout 30 git -C "$repo_abs" fetch -q origin 2>/dev/null || true
@@ -326,23 +381,26 @@ cmd_task() {
   local pf
   pf=$(as_user mktemp /tmp/claude-task.XXXXXX)
   printf '%s\n' "$full" | as_user tee "$pf" >/dev/null
-  if ! tmx_task_new new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "$pf"; then
+  if ! tmx_task_new new-session -d -s "$SESSION" -x 200 -y 50 -c "$workdir" "$SELF" task-run "$SESSION" "$title" "$model" "$pf" "$fix"; then
     as_user rm -f "$pf"; die "tmux new-session failed"
   fi
   tmx set-option -t "=$SESSION:" history-limit 20000 >/dev/null
   tmx set-option -t "=$SESSION:" @task_title "$title" >/dev/null
   tmx set-option -t "=$SESSION:" @task_model "$model" >/dev/null
+  ((fix)) && tmx set-option -t "=$SESSION:" @task_fix 1 >/dev/null
   tmx set-option -t "=$SESSION:" @task_branch "$branch" >/dev/null
   tmx set-option -t "=$SESSION:" @task_dir "$workdir" >/dev/null
   tmx set-option -t "=$SESSION:" @task_repo "$repo_abs" >/dev/null
   echo "started $SESSION ($rcname, $model) in $workdir${branch:+ on $branch}"
 }
 
-# Inside tmux: exec claude for a task. $1 session, $2 title, $3 model, $4 prompt file.
+# Inside tmux: exec claude for a task. $1 session, $2 title, $3 model, $4 prompt file (or --continue),
+# $5 fix flag (1 = fix session: gets the base settings file, without the e2e denies).
 cmd_task_run() {
   load "$1"
   [[ -n $TASK_ID ]] || die "task-run needs a task session name"
   local title=$2 model=$3 pf=$4 prompt
+  FIX=${5:-0}
   if [[ $pf == --continue ]]; then
     session_env
     base_args "$model"
@@ -360,16 +418,22 @@ cmd_task_run() {
 cmd_resume() {
   load "$1"
   [[ -n $TASK_ID ]] || die "resume needs a task session name (<agent>-t-<id>)"
-  local title=${2:?title required} model=${3:-$TASK_MODEL} wt
+  shift
+  local pos=() fix=0 a
+  for a in "$@"; do if [[ $a == --fix ]]; then fix=1; else pos+=("$a"); fi; done
+  local title=${pos[0]:?title required} model=${pos[1]:-$TASK_MODEL} wt
+  [[ $title == Fix:* ]] && fix=1
+  FIX=$fix
   wt=${TASK_WORKTREES:-$DIR/worktrees}/$SESSION
   [[ -d $wt ]] || wt=$DIR
   running && die "$SESSION is already running"
-  check_task_max
+  if ((fix)); then check_no_fix; else check_task_max; fi
   as_user rm -f "/tmp/tmux-$(id -u "$RUN_AS")/$SOCK"
-  tmx_task_new new-session -d -s "$SESSION" -x 200 -y 50 -c "$wt" "$SELF" task-run "$SESSION" "$title" "$model" --continue
+  tmx_task_new new-session -d -s "$SESSION" -x 200 -y 50 -c "$wt" "$SELF" task-run "$SESSION" "$title" "$model" --continue "$fix"
   tmx set-option -t "=$SESSION:" history-limit 20000 >/dev/null
   tmx set-option -t "=$SESSION:" @task_title "$title" >/dev/null
   tmx set-option -t "=$SESSION:" @task_model "$model" >/dev/null
+  ((fix)) && tmx set-option -t "=$SESSION:" @task_fix 1 >/dev/null
   tmx set-option -t "=$SESSION:" @task_branch "$(as_user git -C "$wt" branch --show-current 2>/dev/null)" >/dev/null
   echo "resumed $SESSION ($RC_NAME · $title) in $wt"
 }
@@ -389,11 +453,11 @@ task_ids() {
 
 print_tasks() {
   local id fmt
-  fmt='#{session_name}|#{session_created}|#{@task_model}|#{@task_branch}|#{@task_title}'
+  fmt='#{session_name}|#{session_created}|#{@task_model}|#{@task_fix}|#{@task_branch}|#{@task_title}'
   for id in $(task_ids); do
     SESSION=$NAME-t-$id; SOCK=claude-$SESSION
-    tmx list-sessions -F "$fmt" 2>/dev/null | while IFS='|' read -r sn created m b t; do
-      printf '%-22s %-8s %-9s %-34s %s\n' "$sn" "$(age "$created")" "$m" "${b:--}" "$t"
+    tmx list-sessions -F "$fmt" 2>/dev/null | while IFS='|' read -r sn created m fx b t; do
+      printf '%-22s %-8s %-9s %-4s %-34s %s\n' "$sn" "$(age "$created")" "$m" "$([[ $fx == 1 ]] && echo Y || echo -)" "${b:--}" "$t"
     done || true  # stale socket of a stopped task: skip it rather than abort the listing
   done
 }
@@ -405,7 +469,7 @@ age() {
 
 cmd_tasks() {
   local n
-  printf '%-22s %-8s %-9s %-34s %s\n' SESSION AGE MODEL BRANCH TITLE
+  printf '%-22s %-8s %-9s %-4s %-34s %s\n' SESSION AGE MODEL FIX BRANCH TITLE
   if [[ -n ${1:-} ]]; then ( load "$1"; print_tasks ); return; fi
   for d in "$CONF_DIR"/*.env; do
     n=$(basename "$d" .env)
