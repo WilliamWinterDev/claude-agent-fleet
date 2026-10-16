@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf ~*)",
+      "Bash(rm -rf $HOME*)",
+      "Bash(rm -rf /Users*)",
+      "Bash(rm -rf /root*)",
+      "Bash(rm -rf /home*)",
+      "Bash(rm -rf /srv*)",
+      "Bash(rm -rf /mnt*)",
+      "Bash(rm -rf /etc*)",
+      "Bash(rm -rf /var*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf \"$OLDPWD\"*)",
+      "Bash(rm -rf $OLDPWD*)",
+      "Bash(*ssh *rm -rf*)",
+      "Bash(*ssh *rm -r *)",
+      "Bash(*git push*--force*main*)",
+      "Bash(*git push*-f *main*)",
+      "Bash(*git push*main*--force*)",
+      "Bash(kubectl delete namespace*)",
+      "Bash(kubectl delete ns*)",
+      "Bash(*btrfs subvolume delete*)",
+      "Bash(*mkfs*)",
+      "Bash(*dd if=*)",
+      "Bash(systemctl stop*)",
+      "Bash(systemctl disable*)",
+      "Bash(*pkill -f*)"
+    ]
+  }
+}

@@ -147,10 +147,39 @@ session_env() {
 # Settings file for a session: fix sessions ($FIX=1) get <name>.settings.json, everything else gets
 # <name>.task-settings.json when it exists (it adds the e2e denies), else <name>.settings.json.
 FIX=0
+# Every session also gets $CONF_DIR/global.settings.json (root-owned denies for all agents: rm -rf
+# on home/system paths, rm -rf over ssh, force-push to main, ...). The agent file and the global
+# file are merged into a root-owned file under /run/claude-agents, which is what --settings gets.
 settings_file() {
-  local f=$CONF_DIR/$NAME.settings.json
+  local f=$CONF_DIR/$NAME.settings.json g=$CONF_DIR/global.settings.json
   if [[ $FIX -ne 1 && -f $CONF_DIR/$NAME.task-settings.json ]]; then f=$CONF_DIR/$NAME.task-settings.json; fi
-  [[ -f $f ]] && printf '%s' "$f"
+  if [[ ! -f $g ]]; then [[ -f $f ]] && printf '%s' "$f"; return 0; fi
+  local out=/run/claude-agents/$NAME-$FIX.settings.json
+  if [[ ! -f $out || $g -nt $out || ( -f $f && $f -nt $out ) ]]; then
+    if [[ $EUID -eq 0 ]]; then
+      mkdir -p /run/claude-agents && chmod 755 /run/claude-agents
+      python3 - "$g" "${f:-}" "$out" <<'PY'
+import json, os, sys
+g, f, out = sys.argv[1:]
+merged = json.load(open(g))
+if f and os.path.exists(f):
+    a = json.load(open(f))
+    for k, v in a.items():
+        if k == "permissions":
+            p = merged.setdefault("permissions", {})
+            for pk, pv in v.items():
+                p[pk] = (p.get(pk, []) + [x for x in pv if x not in p.get(pk, [])]) if isinstance(pv, list) else pv
+        else:
+            merged[k] = v
+tmp = out + ".tmp"
+json.dump(merged, open(tmp, "w"), indent=2); os.chmod(tmp, 0o644); os.replace(tmp, out)
+PY
+    elif [[ ! -f $out ]]; then
+      # Not root (an agent starting its own task) and no merged file yet: fall back to the agent file.
+      [[ -f $f ]] && printf '%s' "$f"; return 0
+    fi
+  fi
+  printf '%s' "$out"
   return 0
 }
 
@@ -379,6 +408,7 @@ cmd_task() {
   else
     pre+=" You must not run the end-to-end suite (it is denied for task sessions): use unit tests; e2e runs on every merge to main and a fix session handles failures."
   fi
+  pre+=" Temp folders: create with t=\$(mktemp -d) and remove that exact variable (rm -rf \"\$t\"); never rm -rf a path you did not create, and never rm -rf \$OLDPWD, ~, \$HOME or anything on another machine."
   pre+=" Standing rules for this agent are in $DIR/CLAUDE.md. Do only the task below. When it is done, report once with: agent-handoff --result $NAME \"<short result, PR link if any>\" and then stop and wait. If you are blocked, ask the owner here rather than guessing."
   local full="$pre"$'\n\n'"Task:"$'\n'"$prompt"
 
