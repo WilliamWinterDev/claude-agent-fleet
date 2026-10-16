@@ -90,6 +90,29 @@ load() {
   SOCK=claude-$SESSION
 }
 
+# trust_dir <dir>: mark <dir> trusted in the agent user's ~/.claude.json so a new session there
+# doesn't stop on the "trust this folder" prompt. Trust covers subfolders, so trusting the worktrees
+# folder covers every task worktree. No-op when already trusted; atomic rewrite.
+trust_dir() {
+  as_user python3 - "$1" <<'PY' || echo "warning: could not pre-trust $1" >&2
+import json, os, sys
+d = sys.argv[1]
+f = os.path.expanduser("~/.claude.json")
+try:
+    cfg = json.load(open(f))
+except FileNotFoundError:
+    cfg = {}
+proj = cfg.setdefault("projects", {}).setdefault(d, {})
+if not proj.get("hasTrustDialogAccepted"):
+    proj["hasTrustDialogAccepted"] = True
+    tmp = f"{f}.tmp.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, f)
+PY
+}
+
 # Run a command as the agent's user: via runuser from root, directly if we already are that user.
 as_user() {
   if [[ $(id -un) == "$RUN_AS" ]]; then "$@"
@@ -386,6 +409,8 @@ cmd_task() {
     as_user timeout 30 git -C "$repo_abs" fetch -q origin 2>/dev/null || true
     as_user git -C "$repo_abs" worktree add -q -b "$branch" "$wt" "$base" || die "worktree add failed"
   fi
+  [[ -n $repo_abs ]] && trust_dir "$(dirname "$wt")"
+  trust_dir "$workdir"
   local pf
   pf=$(as_user mktemp /tmp/claude-task.XXXXXX)
   printf '%s\n' "$full" | as_user tee "$pf" >/dev/null
