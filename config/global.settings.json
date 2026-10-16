@@ -26,6 +26,30 @@
       "Bash(systemctl stop*)",
       "Bash(systemctl disable*)",
       "Bash(*pkill -f*)"
+    ],
+    "allow": [
+      "Bash(agent-handoff:*)",
+      "Bash(claude-agent tasks:*)",
+      "Bash(claude-agent task:*)",
+      "Bash(claude-agent say:*)",
+      "Bash(claude-agent peek:*)",
+      "Bash(claude-agent stop:*)",
+      "Bash(claude-agent list:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh issue view:*)",
+      "Bash(git worktree:*)",
+      "Bash(git fetch:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Read(//var/lib/claude-agents/handoffs/**)"
     ]
   }
 }

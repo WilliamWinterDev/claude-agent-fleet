@@ -199,6 +199,9 @@ base_args() {
   [[ -n $sf ]] && ARGS+=(--settings "$sf")
   local d
   for d in $ADD_DIRS; do ARGS+=(--add-dir "$d"); done
+  # Task sessions start in a worktree: let them read the agent's own folder (CLAUDE.md, plans,
+  # notes) without a permission prompt.
+  [[ $PWD != "$DIR" ]] && ARGS+=(--add-dir "$DIR")
   return 0
 }
 
