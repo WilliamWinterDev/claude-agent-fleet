@@ -91,7 +91,7 @@ load() {
 }
 
 # trust_dir <dir>: mark <dir> trusted in the agent user's ~/.claude.json so a new session there
-# doesn't stop on the "trust this folder" prompt. Trust covers subfolders, so trusting the worktrees
+# doesn't stop on the "trust this folder" or "allow external CLAUDE.md imports" prompts. Trust covers subfolders, so trusting the worktrees
 # folder covers every task worktree. No-op when already trusted; atomic rewrite.
 trust_dir() {
   as_user python3 - "$1" <<'PY' || echo "warning: could not pre-trust $1" >&2
@@ -103,8 +103,10 @@ try:
 except FileNotFoundError:
     cfg = {}
 proj = cfg.setdefault("projects", {}).setdefault(d, {})
-if not proj.get("hasTrustDialogAccepted"):
-    proj["hasTrustDialogAccepted"] = True
+want = {"hasTrustDialogAccepted": True, "hasClaudeMdExternalIncludesApproved": True,
+        "hasClaudeMdExternalIncludesWarningShown": True}
+if any(not proj.get(k) for k in want):
+    proj.update(want)
     tmp = f"{f}.tmp.{os.getpid()}"
     with open(tmp, "w") as fh:
         json.dump(cfg, fh, indent=2)
