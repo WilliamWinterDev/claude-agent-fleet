@@ -1,0 +1,1 @@
+Daily review: check open PRs on the repos in ~/repos.txt, review anything new or updated since yesterday, and send me a short summary (one line per PR, flag real bugs first).

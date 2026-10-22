@@ -1,0 +1,9 @@
+[Unit]
+Description=Reviewer agent daily PR review
+
+[Timer]
+OnCalendar=Mon..Fri 08:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

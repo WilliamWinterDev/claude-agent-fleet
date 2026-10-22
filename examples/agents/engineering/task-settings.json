@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(*curl*| sh*)",
+      "Bash(*curl*| bash*)",
+      "Bash(*scripts/e2e.sh*)"
+    ]
+  }
+}
