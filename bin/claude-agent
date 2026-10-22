@@ -8,7 +8,7 @@
 #   claude-agent peek <name>       print the visible screen of the session
 #   claude-agent deliver           deliver queued handoffs from /var/lib/claude-agents/handoffs/inbox
 #   claude-agent list              show agents and whether they're running
-#   claude-agent task <agent> [--repo <path>] [--model <m>] [--name <title>] [--fix] [--dry-run] "<prompt>"
+#   claude-agent task <agent> [--repo <path>] [--model <m>[:effort]] [--name <title>] [--fix] [--dry-run] "<prompt>"
 #                                  start a NEW Remote Control session for one task (see below)
 #   claude-agent tasks [<agent>]   list running task sessions (FIX column: Y for the fix session)
 #   claude-agent resume <agent>-t-<id> "<title>" [model] [--fix]
@@ -210,7 +210,11 @@ base_args() {
   else
     ARGS+=(--permission-mode "$PERMISSION_MODE")
   fi
-  [[ -n ${1:-} ]] && ARGS+=(--model "$1")
+  # model may carry an effort level: "opus:high" -> --model opus --effort high
+  local m=${1:-} e=""
+  [[ $m == *:* ]] && { e=${m#*:}; m=${m%%:*}; }
+  [[ -n $m ]] && ARGS+=(--model "$m")
+  [[ -n $e ]] && ARGS+=(--effort "$e")
   local sf; sf=$(settings_file)
   [[ -n $sf ]] && ARGS+=(--settings "$sf")
   local d
