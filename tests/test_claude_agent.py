@@ -17,7 +17,7 @@ def fleet(tmp_path):
     (agents / "handoffs" / "inbox").mkdir(parents=True)
     (agents / "web").mkdir()
     conf.mkdir()
-    (conf / "fleet.conf").write_text(f'AGENTS_DIR={agents}\nOWNER="Alex"\n')
+    (conf / "fleet.conf").write_text(f'AGENTS_DIR={agents}\nOWNER="Will"\n')
     (conf / "web.env").write_text(f"RC_NAME=Web\nRUN_AS={getpass.getuser()}\nTASK_MODEL=sonnet\n")
     env = dict(os.environ, CLAUDE_AGENT_CONF_DIR=str(conf), TMUX_TMPDIR=str(tmp_path))
     env.pop("AGENT_NAME", None)
@@ -40,7 +40,7 @@ def test_task_dry_run_uses_owner_and_agent_dir(fleet):
     r = run(env, BIN / "claude-agent", "task", "web", "--dry-run", "Fix the login page")
     assert r.returncode == 0, r.stderr
     assert "DRY RUN" in r.stdout and "RC name: Web · Fix the login page" in r.stdout
-    assert "ask Alex here" in r.stdout
+    assert "ask Will here" in r.stdout
     assert f"rules for this agent are in {agents}/web/CLAUDE.md" in r.stdout
     assert "worktree: none" in r.stdout
 
