@@ -6,7 +6,7 @@
 #   claude-agent run <name>        (inside tmux) exec claude with the agent's settings
 #   claude-agent say <name> <msg>  type a prompt into the running session (routines, handoffs)
 #   claude-agent peek <name>       print the visible screen of the session
-#   claude-agent deliver           deliver queued handoffs from /var/lib/claude-agents/handoffs/inbox
+#   claude-agent deliver           deliver queued handoffs from $AGENTS_DIR/handoffs/inbox
 #   claude-agent list              show agents and whether they're running
 #   claude-agent task <agent> [--repo <path>] [--model <m>[:effort]] [--name <title>] [--fix] [--dry-run] "<prompt>"
 #                                  start a NEW Remote Control session for one task (see below)
@@ -24,38 +24,46 @@
 # session is `claude --remote-control "<RC_NAME> · <title>"` with the prompt (plus a short preamble)
 # as its initial prompt. With a repo (--repo, or TASK_REPO) it starts in a fresh git worktree on
 # branch task/<id>-<slug>, which also groups it under that repo in the Claude app; otherwise it
-# starts in /var/lib/claude-agents/<agent>. peek/say work on <agent>-t-<id> too. Root or the agent's own user
+# starts in $AGENTS_DIR/<agent>. peek/say work on <agent>-t-<id> too. Root or the agent's own user
 # can run task/tasks/stop for that agent (no sudo needed for an agent to start its own tasks).
 #
-# Fix sessions (`task --fix`): the "fix agent" for a failed e2e run on main (started by a CI watcher).
+# Fix sessions (`task --fix`): the "fix agent", e.g. started by a CI watcher when e2e fails on main.
 # Title is prefixed "Fix:", the tmux session is marked @task_fix=1, it is exempt from TASK_MAX, and
 # it is refused while another fix session of that agent is running (one at a time). `resume` keeps
 # the flag (a title starting "Fix:" or --fix).
-# Who may run e2e is decided by which --settings file a session gets, two root-owned files:
+# Guarded commands (expensive or shared, like an end-to-end suite) are decided by which --settings
+# file a session gets, two root-owned files:
 #   /etc/claude-agents/<name>.settings.json       base deny rules; used by FIX sessions
-#   /etc/claude-agents/<name>.task-settings.json  base denies plus the e2e denies; used by the standing
-#                                                 master and normal task sessions (when the file exists;
-#                                                 agents without one use <name>.settings.json for all)
-# A master picks the change up on its next restart; running sessions keep what they started with.
+#   /etc/claude-agents/<name>.task-settings.json  base denies plus denies for the guarded commands; used
+#                                                 by the standing master and normal task sessions (when
+#                                                 the file exists; agents without one use
+#                                                 <name>.settings.json for all and have no guarded commands)
+# GUARDED in the env file describes those commands for the task preamble (default "the end-to-end
+# suite"). A master picks the change up on its next restart; running sessions keep what they started with.
 #
 # Optional task vars in the env file: TASK_MODEL (default sonnet), TASK_REPO, TASK_WORKTREES
-# (default /var/lib/claude-agents/<name>/worktrees).
+# (default $AGENTS_DIR/<name>/worktrees).
 #
 # Each agent has a root-owned config /etc/claude-agents/<name>.env (root sources it, so it must
 # never live in a folder the agent's user can write):
 #   RC_NAME (name shown in the Claude app), RUN_AS (user), optional MODEL,
 #   ADD_DIRS (space-separated), PERMISSION_MODE (default bypassPermissions),
 #   ENV_VARS (space-separated KEY=VALUE exported into the session, e.g. ENABLE_CLAUDEAI_MCP_SERVERS=false)
-#   TASK_MODEL, TASK_REPO, TASK_WORKTREES, TASK_MAX (task sessions, above; TASK_MAX 0 = unlimited)
+#   TASK_MODEL, TASK_REPO, TASK_WORKTREES, TASK_MAX (task sessions, above; TASK_MAX 0 = unlimited),
+#   GUARDED (fix sessions, above)
 # plus optional /etc/claude-agents/<name>.settings.json (deny rules, MCP approvals), passed with
 # --settings so the agent can't edit them,
-# and a working folder /var/lib/claude-agents/<name>/ owned by RUN_AS with:
+# and a working folder $AGENTS_DIR/<name>/ owned by RUN_AS with:
 #   secrets.env   optional, mode 600, sourced into the session environment as RUN_AS (never committed)
 #   CLAUDE.md, .mcp.json, .claude/settings.json  the agent's instructions, tools and deny rules
 set -euo pipefail
 
-AGENTS_DIR=/var/lib/claude-agents
-CONF_DIR=/etc/claude-agents
+CONF_DIR=${CLAUDE_AGENT_CONF_DIR:-/etc/claude-agents}  # override only for tests; root runs it from systemd with a clean env
+# Optional root-owned $CONF_DIR/fleet.conf: AGENTS_DIR (agent folders, default /var/lib/claude-agents)
+# and OWNER (who the agents work for, as named in prompts, default "the owner").
+AGENTS_DIR=/var/lib/claude-agents OWNER="the owner"
+# shellcheck source=/dev/null
+[[ -f $CONF_DIR/fleet.conf ]] && source "$CONF_DIR/fleet.conf"
 HANDOFF_DIR=$AGENTS_DIR/handoffs
 
 die() { echo "claude-agent: $*" >&2; exit 1; }
@@ -83,7 +91,7 @@ load() {
   DIR=$AGENTS_DIR/$NAME
   [[ -f $CONF_DIR/$NAME.env ]] || die "no $CONF_DIR/$NAME.env"
   RC_NAME=$NAME RUN_AS=root MODEL="" ADD_DIRS="" PERMISSION_MODE=bypassPermissions ENV_VARS=""
-  TASK_MODEL=sonnet TASK_REPO="" TASK_WORKTREES="" TASK_MAX=0
+  TASK_MODEL=sonnet TASK_REPO="" TASK_WORKTREES="" TASK_MAX=0 GUARDED="the end-to-end suite"
   # shellcheck source=/dev/null
   source "$CONF_DIR/$NAME.env"
   if [[ -n $TASK_ID ]]; then SESSION=$NAME-t-$TASK_ID; else SESSION=$NAME; fi
@@ -120,8 +128,8 @@ PY
 # with every running root session, and one of those can rewrite the file and drop the new entry.
 # Runs in the background; only ever answers that exact prompt.
 answer_startup_prompts() {
-  local i
-  for i in $(seq 30); do
+  local _
+  for _ in $(seq 30); do
     sleep 2
     running || return 0
     if tmx capture-pane -p -t "=$SESSION:" 2>/dev/null | grep -q 'Allow external CLAUDE.md file imports?'; then
@@ -163,7 +171,7 @@ session_env() {
 }
 
 # Settings file for a session: fix sessions ($FIX=1) get <name>.settings.json, everything else gets
-# <name>.task-settings.json when it exists (it adds the e2e denies), else <name>.settings.json.
+# <name>.task-settings.json when it exists (it adds the guarded-command denies), else <name>.settings.json.
 FIX=0
 # Every session also gets $CONF_DIR/global.settings.json (root-owned denies for all agents: rm -rf
 # on home/system paths, rm -rf over ssh, force-push to main, ...). The agent file and the global
@@ -338,11 +346,11 @@ cmd_deliver() {
     mv "$f" "$HANDOFF_DIR/delivered/$base"
     chmod 640 "$HANDOFF_DIR/delivered/$base"
     if [[ $kind == result ]]; then
-      cmd_say "$to" "Result from the $from agent for a job you handed over: read $HANDOFF_DIR/delivered/$base. Do not reply to it with agent-handoff; tell the owner if it matters."
+      cmd_say "$to" "Result from the $from agent for a job you handed over: read $HANDOFF_DIR/delivered/$base. Do not reply to it with agent-handoff; tell $OWNER if it matters."
     elif [[ ! -f $CONF_DIR/$from.env && $from != owner ]]; then
-      cmd_say "$to" "Alert from $from (an automated watcher, not an agent): read $HANDOFF_DIR/delivered/$base and handle it as your CLAUDE.md says. Don't reply with agent-handoff; tell the owner only if they need to know or act."
+      cmd_say "$to" "Alert from $from (an automated watcher, not an agent): read $HANDOFF_DIR/delivered/$base and handle it as your CLAUDE.md says. Don't reply with agent-handoff; tell $OWNER only if they need to know or act."
     elif [[ $from == owner ]]; then
-      cmd_say "$to" "Job from the owner: read $HANDOFF_DIR/delivered/$base and do what it asks."
+      cmd_say "$to" "Job from $OWNER: read $HANDOFF_DIR/delivered/$base and do what it asks."
     else
       cmd_say "$to" "Handoff from the $from agent: read $HANDOFF_DIR/delivered/$base and do what it asks. When finished, report back once with: agent-handoff --result $from \"<short result>\""
     fi
@@ -428,13 +436,17 @@ cmd_task() {
   else
     pre+=" You are in $workdir. If you change a repo, work on a branch and open a PR; never push to main."
   fi
-  if ((fix)); then
-    pre+=" You are the FIX session: the only session allowed to run the end-to-end suite, because it failed on main. Only one fix session runs at a time."
-  else
-    pre+=" You must not run the end-to-end suite (it is denied for task sessions): use unit tests; e2e runs on every merge to main and a fix session handles failures."
+  if [[ -f $CONF_DIR/$NAME.task-settings.json ]]; then
+    if ((fix)); then
+      pre+=" You are the FIX session: the only session allowed to run $GUARDED. Only one fix session runs at a time."
+    else
+      pre+=" You must not run $GUARDED (it is denied for task sessions): use unit tests; a fix session (claude-agent task --fix) runs it when needed."
+    fi
+  elif ((fix)); then
+    pre+=" You are the FIX session. Only one fix session runs at a time."
   fi
   pre+=" Temp folders: create with t=\$(mktemp -d) and remove that exact variable (rm -rf \"\$t\"); never rm -rf a path you did not create, and never rm -rf \$OLDPWD, ~, \$HOME or anything on another machine."
-  pre+=" Standing rules for this agent are in $DIR/CLAUDE.md. Do only the task below. When it is done, report once with: agent-handoff --result $NAME \"<short result, PR link if any>\" and then stop and wait. If you are blocked, ask the owner here rather than guessing."
+  pre+=" Standing rules for this agent are in $DIR/CLAUDE.md. Do only the task below. When it is done, report once with: agent-handoff --result $NAME \"<short result, PR link if any>\" and then stop and wait. If you are blocked, ask $OWNER here rather than guessing."
   local full="$pre"$'\n\n'"Task:"$'\n'"$prompt"
 
   if ((dry)); then
@@ -485,7 +497,7 @@ cmd_task() {
 }
 
 # Inside tmux: exec claude for a task. $1 session, $2 title, $3 model, $4 prompt file (or --continue),
-# $5 fix flag (1 = fix session: gets the base settings file, without the e2e denies).
+# $5 fix flag (1 = fix session: gets the base settings file, without the guarded-command denies).
 cmd_task_run() {
   load "$1"
   [[ -n $TASK_ID ]] || die "task-run needs a task session name"

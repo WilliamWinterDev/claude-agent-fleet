@@ -3,20 +3,24 @@
 # Queue a job for another Claude agent on this host (e.g. `agent-handoff engineering "Deploy ..."`).
 # Use --result when reporting back on a job you were handed: results never ask for a reply,
 # so agents can't ping-pong.
-# The message is saved in /var/lib/claude-agents/handoffs/inbox and typed into the target agent's session
+# The message is saved in $AGENTS_DIR/handoffs/inbox and typed into the target agent's session
 # by claude-agent-handoff.path within a few seconds. Pass the message as an argument or on stdin.
 set -euo pipefail
 
-INBOX=/var/lib/claude-agents/handoffs/inbox
+AGENTS_DIR=/var/lib/claude-agents
+CONF_DIR=${CLAUDE_AGENT_CONF_DIR:-/etc/claude-agents}
+# shellcheck source=/dev/null
+[[ -f $CONF_DIR/fleet.conf ]] && source "$CONF_DIR/fleet.conf"
+INBOX=$AGENTS_DIR/handoffs/inbox
 kind=request
 if [[ ${1:-} == --result ]]; then kind=result; shift; fi
 to=${1:?usage: agent-handoff <to-agent> <message...>}; shift
-[[ $to =~ ^[a-z0-9-]+$ && -d /var/lib/claude-agents/$to ]] || { echo "agent-handoff: unknown agent '$to'" >&2; exit 1; }
+[[ $to =~ ^[a-z0-9-]+$ && -d $AGENTS_DIR/$to ]] || { echo "agent-handoff: unknown agent '$to'" >&2; exit 1; }
 
-# The sending agent is the /var/lib/claude-agents/<name> folder we're running in.
+# The sending agent is the $AGENTS_DIR/<name> folder we're running in.
 from=${AGENT_NAME:-}
 if [[ -z $from ]]; then
-  case $PWD in /var/lib/claude-agents/*) from=${PWD#/var/lib/claude-agents/}; from=${from%%/*} ;; *) from=owner ;; esac
+  case $PWD in "$AGENTS_DIR"/*) from=${PWD#"$AGENTS_DIR"/}; from=${from%%/*} ;; *) from=owner ;; esac
 fi
 
 msg=$*
