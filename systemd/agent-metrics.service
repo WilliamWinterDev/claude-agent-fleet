@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude agent metrics to the node-exporter textfile dir
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agent-metrics
+Nice=10

@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""agent-metrics: write Prometheus metrics about the Claude agents to the node-exporter textfile dir
+(agent_metrics.prom). Run by agent-metrics.timer every minute. Read-only: it never touches the things it
+measures. Every section is independent: an input that doesn't exist is skipped, a broken one doesn't stop
+the others, and agent_metrics_section_ok{section} says which failed.
+
+Sections and their inputs:
+  cgroups   memory.current/high/max and memory.events (high, max, oom_kill) of every
+            claude-agent@*.service, plus EXTRA_CGROUPS ("name=path ...", paths relative to
+            CGROUP_ROOT), e.g. "web-tasks=user.slice/user-<uid>.slice" for an agent user's task sessions
+  swap      /proc/swaps per device, and zram compression when ZRAM_MM_STAT exists
+  sessions  claude-agent's event log (task start/fix start/resume/stop, one TSV line each: epoch event
+            agent task kind title); running tasks come from the live tmux sockets
+  queues    optional JOB_EVENTS log written by your own build/test wrappers, one TSV line per finished
+            run: start end duration wait queue label exit. Queue names are free-form ([a-z0-9_-]+)
+
+Config: built-in defaults, then /etc/claude-agents/agent-metrics.conf (KEY=value lines, keys as in CFG
+upper-cased), then environment variables of the same names. `--print` writes to stdout instead.
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import time
+
+CFG = {
+    "textfile_dir": "/var/lib/node_exporter/textfile",
+    "cgroup_root": "/sys/fs/cgroup",
+    "extra_cgroups": "",
+    "proc_swaps": "/proc/swaps",
+    "zram_mm_stat": "/sys/block/zram0/mm_stat",
+    "agent_events": "/var/log/claude-agent/events.log",
+    "job_events": "/var/log/claude-agent/jobs.log",
+    "conf_dir": "/etc/claude-agents",
+    "tmux_sockets": "/tmp/tmux-*/claude-*-t-*",
+}
+CONF_FILE = os.environ.get("AGENT_METRICS_CONF", "/etc/claude-agents/agent-metrics.conf")
+
+DAY = 86400
+NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def load_config(path=CONF_FILE, environ=os.environ):
+    cfg = dict(CFG)
+    try:
+        with open(path) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and not k.startswith("#") and k.lower() in cfg:
+                    cfg[k.lower()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    for k in cfg:
+        if k.upper() in environ:
+            cfg[k] = environ[k.upper()]
+    return cfg
+
+
+def esc(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+class Out:
+    """Collects samples grouped by metric so each HELP/TYPE appears once."""
+
+    def __init__(self):
+        self.meta, self.samples, self.order = {}, {}, []
+
+    def add(self, name, value, labels=None, mtype="gauge", help_=""):
+        if name not in self.meta:
+            self.meta[name] = (mtype, help_)
+            self.samples[name] = []
+            self.order.append(name)
+        lab = ""
+        if labels:
+            lab = "{" + ",".join(f'{k}="{esc(v)}"' for k, v in labels.items()) + "}"
+        if isinstance(value, float):
+            value = repr(round(value, 3)) if value != int(value) else str(int(value))
+        self.samples[name].append(f"{name}{lab} {value}")
+
+    def render(self):
+        lines = []
+        for n in self.order:
+            t, h = self.meta[n]
+            lines += [f"# HELP {n} {h}", f"# TYPE {n} {t}"] + self.samples[n]
+        return "\n".join(lines) + "\n"
+
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+def read_tsv(path):
+    """Rows of a TSV event log; a missing file or a malformed line is skipped, never raises."""
+    rows = []
+    try:
+        text = read(path)
+    except OSError:
+        return rows
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0].isdigit():
+            rows.append(parts)
+    return rows
+
+
+def pct(values, q):
+    """Nearest-rank percentile."""
+    if not values:
+        return None
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(-(-q * len(s) // 100)) - 1))
+    return s[k]
+
+
+def avg(values):
+    return sum(values) / len(values) if values else None
+
+
+def summarize(out, prefix, label_names, groups, now):
+    """groups: {label tuple: [(end_ts, value), ...]} -> sum/count counters and 24h avg/p90 gauges."""
+    for key, items in groups.items():
+        lab = dict(zip(label_names, key))
+        vals = [v for _, v in items]
+        out.add(f"{prefix}_sum", sum(vals), lab, "counter", f"{prefix} total seconds")
+        out.add(f"{prefix}_count", len(vals), lab, "counter", f"{prefix} number of samples")
+        recent = [v for t, v in items if t >= now - DAY]
+        if recent:
+            out.add(f"{prefix}_avg_24h", avg(recent), lab, help_=f"{prefix} average over the last 24h")
+            out.add(f"{prefix}_p90_24h", pct(recent, 90), lab, help_=f"{prefix} 90th percentile over the last 24h")
+
+
+# ---------------------------------------------------------------------------------------- cgroups
+def cgroup_paths(cfg):
+    root = cfg["cgroup_root"]
+    found = {}
+    for d in sorted(glob.glob(f"{root}/system.slice/*/claude-agent@*.service")
+                    + glob.glob(f"{root}/system.slice/claude-agent@*.service")):
+        found[os.path.basename(d)[len("claude-agent@"):-len(".service")]] = d
+    for item in cfg["extra_cgroups"].split():
+        name, sep, rel = item.partition("=")
+        if sep and NAME_RE.match(name) and os.path.isdir(f"{root}/{rel}"):
+            found[name] = f"{root}/{rel}"
+    return found
+
+
+def cgroups(out, cfg):
+    for name, path in cgroup_paths(cfg).items():
+        lab = {"cgroup": name}
+        for f, metric in (("memory.current", "current"), ("memory.high", "high"), ("memory.max", "max")):
+            try:
+                v = read(f"{path}/{f}").strip()
+            except OSError:
+                continue
+            if v.isdigit():  # "max" = no limit: no series, so threshold lines only draw real caps
+                out.add(f"agent_cgroup_memory_{metric}_bytes", int(v), lab, help_=f"cgroup memory.{metric}")
+        try:
+            ev = dict(line.split() for line in read(f"{path}/memory.events").splitlines())
+        except (OSError, ValueError):
+            continue
+        for e in ("high", "max", "oom_kill"):
+            if e in ev:
+                out.add("agent_cgroup_memory_events_total", int(ev[e]), {"cgroup": name, "event": e},
+                        "counter", "cgroup memory.events counters: times the high/max limit was hit, OOM kills")
+
+
+# ------------------------------------------------------------------------------------------- swap
+def swap(out, cfg):
+    try:
+        lines = read(cfg["proc_swaps"]).splitlines()[1:]
+    except OSError:
+        lines = []
+    for line in lines:
+        f = line.split()
+        if len(f) < 4:
+            continue
+        dev = "zram" if "zram" in f[0] else os.path.basename(f[0])
+        out.add("agent_swap_size_bytes", int(f[2]) * 1024, {"device": dev}, help_="Swap size per device")
+        out.add("agent_swap_used_bytes", int(f[3]) * 1024, {"device": dev}, help_="Swap used per device")
+    try:
+        mm = read(cfg["zram_mm_stat"]).split()
+    except OSError:
+        return
+    orig, compr, used = int(mm[0]), int(mm[1]), int(mm[2])
+    out.add("agent_zram_orig_bytes", orig, help_="zram: uncompressed data stored")
+    out.add("agent_zram_compressed_bytes", compr, help_="zram: compressed size of that data")
+    out.add("agent_zram_mem_used_bytes", used, help_="zram: RAM actually used including overhead")
+    if compr > 0:
+        out.add("agent_zram_compression_ratio", orig / compr, help_="zram: original / compressed size")
+
+
+# ---------------------------------------------------------------------------------------- sessions
+def run_tmux(sock):
+    r = subprocess.run(["tmux", "-S", sock, "list-sessions", "-F",
+                        "#{session_name}|#{session_created}|#{@task_fix}|#{@task_title}"],
+                       capture_output=True, text=True, timeout=10)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def running_tasks(cfg):
+    """[(agent, task_id, kind, created_epoch)] from the live tmux sockets (the truth, even if a session
+    died without `claude-agent stop`)."""
+    found = []
+    for sock in sorted(glob.glob(cfg["tmux_sockets"])):
+        m = re.search(r"claude-(.+)-t-([0-9a-f]{6})$", sock)
+        if not m:
+            continue
+        try:
+            text = run_tmux(sock)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in text.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3 and parts[1].isdigit():
+                found.append((m.group(1), m.group(2), "fix" if parts[2] == "1" else "task", int(parts[1])))
+                break
+    return found
+
+
+def known_agents(cfg):
+    names = [os.path.basename(p)[:-4] for p in glob.glob(cfg["conf_dir"] + "/*.env")]
+    return sorted(n for n in names if re.match(r"^[a-z0-9-]+$", n))
+
+
+def sessions(out, cfg, now, running):
+    started, resumed, first_start, life = {}, {}, {}, {}
+    for r in read_tsv(cfg["agent_events"]):
+        try:
+            ts, event, agent, task, kind = int(r[0]), r[1], r[2], r[3], r[4]
+        except (IndexError, ValueError):
+            continue
+        if event in ("task_start", "fix_start"):
+            started[(agent, kind)] = started.get((agent, kind), 0) + 1
+            first_start.setdefault((agent, task), ts)
+        elif event == "resume":
+            resumed[agent] = resumed.get(agent, 0) + 1
+            first_start.setdefault((agent, task), ts)
+        elif event == "stop" and (agent, task) in first_start and ts >= first_start[(agent, task)]:
+            life.setdefault((agent, kind), []).append((ts, ts - first_start[(agent, task)]))
+    agents = set(known_agents(cfg)) | {a for a, _ in started} | {a for a, _, _, _ in running}
+    for a in sorted(agents):
+        for kind in ("task", "fix"):
+            out.add("agent_tasks_started_total", started.get((a, kind), 0), {"agent": a, "kind": kind}, "counter",
+                    "Task sessions started (kind=fix: fix sessions)")
+            n = [t for t in running if t[0] == a and t[2] == kind]
+            out.add("agent_tasks_running", len(n), {"agent": a, "kind": kind}, help_="Task sessions running now (live tmux sockets)")
+            if n:
+                out.add("agent_task_oldest_age_seconds", now - min(t[3] for t in n), {"agent": a, "kind": kind},
+                        help_="Age of the oldest running task session")
+        out.add("agent_tasks_resumed_total", resumed.get(a, 0), {"agent": a}, "counter", "Task sessions resumed")
+    summarize(out, "agent_task_lifetime_seconds", ["agent", "kind"], life, now)
+
+
+# ------------------------------------------------------------------------------------------ queues
+def queues(out, cfg, now):
+    runs, dur, wait, last = {}, {}, {}, {}
+    for r in read_tsv(cfg["job_events"]):
+        try:
+            end, d, w, q, rc = int(r[1]), int(r[2]), int(r[3]), r[4], int(r[6])
+        except (IndexError, ValueError):
+            continue
+        if not NAME_RE.match(q):
+            continue
+        res = "ok" if rc == 0 else "fail"
+        runs[(q, res)] = runs.get((q, res), 0) + 1
+        runs.setdefault((q, "fail" if res == "ok" else "ok"), 0)
+        dur.setdefault((q,), []).append((end, d))
+        wait.setdefault((q,), []).append((end, w))
+        last[q] = max(end, last.get(q, 0))
+    for (q, res), n in sorted(runs.items()):
+        out.add("agent_queue_runs_total", n, {"queue": q, "result": res}, "counter", "Finished runs by queue and result (ok = exit 0)")
+    summarize(out, "agent_queue_run_duration_seconds", ["queue"], dur, now)
+    summarize(out, "agent_queue_wait_seconds", ["queue"], wait, now)
+    for q, t in sorted(last.items()):
+        out.add("agent_queue_last_run_timestamp_seconds", t, {"queue": q}, help_="End of the last run")
+
+
+# ------------------------------------------------------------------------------------------------ run
+def collect(cfg=None, now=None):
+    cfg = cfg or load_config()
+    now = int(now if now is not None else time.time())
+    out = Out()
+    running = []
+    try:
+        running = running_tasks(cfg)
+    except Exception:  # noqa: BLE001 - one section must never take the others down
+        pass
+    sections = [("cgroups", lambda: cgroups(out, cfg)), ("swap", lambda: swap(out, cfg)),
+                ("sessions", lambda: sessions(out, cfg, now, running)),
+                ("queues", lambda: queues(out, cfg, now))]
+    for name, fn in sections:
+        try:
+            fn()
+            ok = 1
+        except Exception as e:  # noqa: BLE001
+            ok = 0
+            print(f"agent-metrics: section {name} failed: {e}", file=sys.stderr)
+        out.add("agent_metrics_section_ok", ok, {"section": name}, help_="1 if the section exported cleanly this run")
+    out.add("agent_metrics_last_run_timestamp_seconds", now, help_="Last run of agent-metrics")
+    return out.render()
+
+
+def write(cfg, name, text):
+    d = cfg["textfile_dir"]
+    os.makedirs(d, exist_ok=True)
+    tmp = f"{d}/{name}.prom.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, f"{d}/{name}.prom")
+
+
+if __name__ == "__main__":
+    config = load_config()
+    text = collect(config)
+    if "--print" in sys.argv:
+        sys.stdout.write(text)
+    else:
+        write(config, "agent_metrics", text)
