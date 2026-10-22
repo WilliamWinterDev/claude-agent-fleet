@@ -25,12 +25,7 @@ to trust with root. So the work is split up:
   `--settings`, so an agent can't loosen its own rules. Agents that read untrusted input (PRs from
   strangers, web pages) run as unprivileged users.
 
-The commits are the real development history. The code started out inside a larger private
-infrastructure repo; when it moved here, files that weren't part of the fleet were left out,
-setup-specific details were made generic in every version, and commit messages were reworded to
-match. The last five commits are from the extraction: configuration, examples, docs and tests,
-plus `agent-fix` and `agent-metrics`, whose originals were too tied to that setup to clean up and
-were rewritten in generic form.
+Extracted from my own setup, with the setup-specific details made generic.
 
 ## Architecture
 
