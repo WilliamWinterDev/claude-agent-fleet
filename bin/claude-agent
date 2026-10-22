@@ -115,6 +115,22 @@ if any(not proj.get(k) for k in want):
 PY
 }
 
+# answer_startup_prompts: for ~60s after a task starts, accept the "allow external CLAUDE.md imports"
+# prompt if it shows anyway. trust_dir pre-approves it, but a root agent shares root's ~/.claude.json
+# with every running root session, and one of those can rewrite the file and drop the new entry.
+# Runs in the background; only ever answers that exact prompt.
+answer_startup_prompts() {
+  local i
+  for i in $(seq 30); do
+    sleep 2
+    running || return 0
+    if tmx capture-pane -p -t "=$SESSION:" 2>/dev/null | grep -q 'Allow external CLAUDE.md file imports?'; then
+      tmx send-keys -t "=$SESSION:" Down Enter
+      return 0
+    fi
+  done
+}
+
 # Run a command as the agent's user: via runuser from root, directly if we already are that user.
 as_user() {
   if [[ $(id -un) == "$RUN_AS" ]]; then "$@"
@@ -460,6 +476,7 @@ cmd_task() {
   tmx set-option -t "=$SESSION:" @task_dir "$workdir" >/dev/null
   tmx set-option -t "=$SESSION:" @task_repo "$repo_abs" >/dev/null
   ev_log "$( ((fix)) && echo fix_start || echo task_start )" "$NAME" "$id" "$( ((fix)) && echo fix || echo task )" "$title"
+  (answer_startup_prompts </dev/null >/dev/null 2>&1 &)
   echo "started $SESSION ($rcname, $model) in $workdir${branch:+ on $branch}"
 }
 
