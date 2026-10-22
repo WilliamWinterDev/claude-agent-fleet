@@ -1,0 +1,10 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning bin/claude-agent bin/agent-handoff install.sh
+      - run: pip install pytest && pytest -q tests
