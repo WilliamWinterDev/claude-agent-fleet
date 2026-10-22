@@ -1,0 +1,8 @@
+[Unit]
+Description=Start/steer agent fixes requested from a dashboard
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agent-fix poll
+TimeoutStartSec=5min
