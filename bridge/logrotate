@@ -1,0 +1,10 @@
+/var/log/claude-bridge/audit.log {
+    weekly
+    rotate 8
+    maxsize 20M
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su claude-bridge claude-bridge
+}

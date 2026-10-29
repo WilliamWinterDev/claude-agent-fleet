@@ -1,0 +1,5 @@
+# /etc/claude-bridge/helper.conf (0644 root:root; the helper refuses it if anyone else can write it).
+# Standing agents the bridge may reach, space-separated claude-agent names. Task sessions never.
+SESSIONS=engineering
+# Who the relayed messages say they come from, in the prefix the helper adds to every message.
+CLIENT_NAME=Grok
