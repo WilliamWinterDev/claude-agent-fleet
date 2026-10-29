@@ -58,6 +58,7 @@ flowchart LR
 | `systemd/` | `claude-agent@.service` (one per agent, restarts and resumes), the handoff `.path` watcher, routine and agent-fix/metrics timers. |
 | `config/global.settings.json` | Deny rules every session gets (no `rm -rf` on home/system paths or over ssh, no force-push to main, no `pkill -f`...) plus allows for safe read-only commands. |
 | `examples/` | Two example agents and a routine. |
+| `bridge/` | Optional add-on: an MCP server so a remote client (Grok, another Claude, a script) can read and message allow-listed agents. See [docs/bridge.md](docs/bridge.md). |
 
 ### Standing agents
 
@@ -139,6 +140,20 @@ you change `AGENTS_DIR`.
 Secrets go in `<AGENTS_DIR>/<name>/secrets.env` (mode 600, never committed); they're exported into
 the agent's session only.
 
+## Optional: claude-bridge
+
+`bridge/` lets one remote MCP client check on, read and message your standing agents, for example a
+Grok bot you chat with, which then gets a webhook when the work it asked for is done, needs input
+or opened a PR. Three tools (`list_sessions`, `get_session`, `send_message`), an unprivileged
+service with a fixed-argv root helper, an allow-list of agents, two auth layers (Cloudflare Access
+service token + bearer token, or tailnet + bearer token), rate limits and an audit log without
+message bodies. It is remote code execution into a Claude session, so read the security model in
+[docs/bridge.md](docs/bridge.md) before you expose it.
+
+```bash
+sudo bridge/install.sh          # installs, enables nothing
+```
+
 ## Commands
 
 ```
@@ -156,8 +171,8 @@ agent-handoff --result <to> "<result>" # report back; results never ask for a re
 ## Tests
 
 ```bash
-pytest -q tests
-shellcheck -S warning bin/claude-agent bin/agent-handoff install.sh
+pytest -q tests                 # the bridge tests need python3-cryptography
+shellcheck -S warning bin/claude-agent bin/agent-handoff install.sh bridge/install.sh
 ```
 
 ## License

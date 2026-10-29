@@ -1,0 +1,36 @@
+[Unit]
+Description=claude-bridge: MCP bridge from a remote client to allow-listed Claude agent sessions
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Slice=claude-bridge.slice
+User=claude-bridge
+Group=claude-bridge
+EnvironmentFile=/etc/claude-bridge/bridge.env
+ExecStart=/usr/bin/python3 -E -s /usr/local/lib/claude-bridge/bridge_server.py
+Restart=always
+RestartSec=5
+StateDirectory=claude-bridge
+LogsDirectory=claude-bridge
+StateDirectoryMode=0700
+LogsDirectoryMode=0750
+# The bridge calls the root helper through sudo, and sudo stays inside this unit's sandbox. So NOT set:
+# NoNewPrivileges/PrivateUsers (sudo is setuid), PrivateTmp (hides /tmp/tmux-<uid>, the agents' tmux
+# sockets) and ProtectHome (hides ~/.claude/projects, the transcripts). With them the helper reports
+# every session as "not running".
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

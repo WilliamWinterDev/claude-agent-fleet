@@ -1,0 +1,7 @@
+[Unit]
+Description=Memory cap for claude-bridge
+
+[Slice]
+MemoryHigh=512M
+MemoryMax=1G
+TasksMax=200

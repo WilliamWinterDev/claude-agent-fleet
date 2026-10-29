@@ -1,0 +1,8 @@
+# claude-bridge may run exactly the root helper with one of five fixed subcommands and no other arguments.
+# Session id and message text go on stdin; the helper checks the session against its root-owned allow-list.
+Cmnd_Alias CLAUDE_BRIDGE_READ = /usr/local/sbin/claude-bridge-helper sessions, /usr/local/sbin/claude-bridge-helper status, /usr/local/sbin/claude-bridge-helper transcript, /usr/local/sbin/claude-bridge-helper peek
+Cmnd_Alias CLAUDE_BRIDGE_SAY = /usr/local/sbin/claude-bridge-helper say
+claude-bridge ALL=(root) NOPASSWD: CLAUDE_BRIDGE_READ, CLAUDE_BRIDGE_SAY
+Defaults:claude-bridge !requiretty, env_reset, secure_path="/usr/local/bin:/usr/bin:/bin"
+# The watcher polls the read-only subcommands every 20 s; logging those would bury the `say` lines.
+Defaults!CLAUDE_BRIDGE_READ !log_allowed, !pam_session

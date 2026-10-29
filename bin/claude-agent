@@ -320,9 +320,23 @@ cmd_say() {
   running || die "$SESSION is not running"
   # One line only: the Claude Code prompt submits on Enter.
   msg=${msg//$'\n'/ }
-  tmx send-keys -t "=$SESSION:" -l -- "$msg"
-  sleep 0.5
-  tmx send-keys -t "=$SESSION:" Enter
+  # tmux reads a trailing ";" in an argument as a command separator
+  [[ $msg == *';' ]] && msg+=' '
+  # The optional claude-bridge add-on (bridge/) types into sessions under a flock on its state
+  # directory; take it too so a handoff and a bridge message can't interleave. Best effort: after 5 s,
+  # or when the caller can't open the directory (non-root), it types anyway. The directory itself,
+  # never a file in it: the bridge user owns it and could plant a symlink. No bridge = no lock.
+  local lock=/var/lib/claude-bridge
+  if [[ -d $lock && ! -L $lock ]] && { : 9<"$lock"; } 2>/dev/null; then
+    ( flock -w 5 9 || true
+      tmx send-keys -t "=$SESSION:" -l -- "$msg"
+      sleep 0.5
+      tmx send-keys -t "=$SESSION:" Enter ) 9<"$lock"
+  else
+    tmx send-keys -t "=$SESSION:" -l -- "$msg"
+    sleep 0.5
+    tmx send-keys -t "=$SESSION:" Enter
+  fi
 }
 
 cmd_peek() {
